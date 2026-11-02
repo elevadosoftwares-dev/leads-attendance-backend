@@ -5,10 +5,12 @@ import { pinoHttp } from 'pino-http';
 import { env, isTest } from './config/env';
 import { errorHandler } from './middleware/errorHandler';
 import { notFound } from './middleware/notFound';
+import { adminRouter } from './modules/admin/admin.routes';
 import { attendanceRouter } from './modules/attendance/attendance.routes';
 import { createAuthRouter } from './modules/auth/auth.routes';
 import { healthRouter } from './modules/health/health.routes';
 import { meRouter } from './modules/me/me.routes';
+import { filesRouter, tasksRouter } from './modules/tasks/tasks.routes';
 import { logger } from './utils/logger';
 
 function apiRouter(): Router {
@@ -17,6 +19,9 @@ function apiRouter(): Router {
   router.use('/auth', createAuthRouter());
   router.use('/me', meRouter);
   router.use('/attendance', attendanceRouter);
+  router.use('/tasks', tasksRouter);
+  router.use('/files', filesRouter);
+  router.use('/admin', adminRouter);
   return router;
 }
 
