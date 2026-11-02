@@ -4,6 +4,11 @@ import { env } from '../config/env';
 const WORK_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 
+/** Current instant truncated to whole seconds, matching what DATETIME2(0) stores. */
+export function nowUtc(): Date {
+  return new Date(Math.floor(Date.now() / 1000) * 1000);
+}
+
 /** The work date (`YYYY-MM-DD`, company timezone) that a UTC instant falls on. */
 export function toWorkDate(utc: Date, tz: string = env.APP_TIMEZONE): string {
   return formatInTimeZone(utc, tz, 'yyyy-MM-dd');
