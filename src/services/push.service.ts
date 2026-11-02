@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { cert, getApps, initializeApp, type App } from 'firebase-admin/app';
-import { getMessaging, type Messaging } from 'firebase-admin/messaging';
+import { getMessaging, type BatchResponse, type MulticastMessage } from 'firebase-admin/messaging';
 import { env } from '../config/env';
 import type { Role } from '../modules/auth/auth.types';
 import * as devicesRepo from '../modules/devices/devices.repository';
@@ -22,8 +22,10 @@ const DEAD_TOKEN_CODES = new Set([
 
 const FCM_BATCH_SIZE = 500;
 
-/** The subset of firebase-admin messaging we use; swappable in tests. */
-export type MessagingClient = Pick<Messaging, 'sendEachForMulticast'>;
+/** The subset of firebase-admin messaging we use (token-based multicast); swappable in tests. */
+export interface MessagingClient {
+  sendEachForMulticast(message: MulticastMessage): Promise<BatchResponse>;
+}
 
 let client: MessagingClient | null | undefined;
 
