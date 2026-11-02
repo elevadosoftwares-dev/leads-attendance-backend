@@ -1,0 +1,27 @@
+# Local SQL Server for development and tests.
+#   docker compose up -d
+# Then set DB_SERVER=localhost, DB_USER=sa, DB_PASSWORD=<MSSQL_SA_PASSWORD below> in .env.
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: leads-attendance-mssql
+    environment:
+      ACCEPT_EULA: 'Y'
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-Leads_Dev_Passw0rd!}
+    ports:
+      - '1433:1433'
+    volumes:
+      - mssql-data:/var/opt/mssql
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$${MSSQL_SA_PASSWORD}" -C -Q "SELECT 1" || exit 1',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mssql-data:

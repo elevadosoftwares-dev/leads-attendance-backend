@@ -1,0 +1,8 @@
+dist
+node_modules
+uploads
+coverage
+package-lock.json
+*.sql
+*.md
+uploads-test
