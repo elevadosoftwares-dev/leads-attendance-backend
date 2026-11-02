@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Hosting with iisnode. Copy dist/, node_modules/ (production only), db/migrations/ and package.json to the
+  site root and rename this file to web.config. iisnode passes the port as a named pipe via PORT.
+  iisnode does not proxy WebSockets: Socket.IO falls back to long-polling. Set ENABLE_CRON=false here and run the
+  background jobs on a separate always-on instance (iisnode recycles processes).
+-->
+<configuration>
+  <system.webServer>
+    <webSocket enabled="false" />
+    <handlers>
+      <add name="iisnode" path="dist/src/server.js" verb="*" modules="iisnode" />
+    </handlers>
+    <rewrite>
+      <rules>
+        <rule name="NodeApp" stopProcessing="true">
+          <match url=".*" />
+          <action type="Rewrite" url="dist/src/server.js" />
+        </rule>
+      </rules>
+    </rewrite>
+    <security>
+      <requestFiltering>
+        <hiddenSegments>
+          <add segment="node_modules" />
+          <add segment="uploads" />
+          <add segment=".env" />
+        </hiddenSegments>
+        <requestLimits maxAllowedContentLength="12582912" />
+      </requestFiltering>
+    </security>
+    <iisnode node_env="production" loggingEnabled="true" devErrorsEnabled="false" />
+  </system.webServer>
+</configuration>

@@ -1,0 +1,1403 @@
+openapi: 3.1.0
+info:
+  title: LEADS Attendance API
+  version: 1.0.0
+  description: |
+    Workforce attendance and task management API for LEADS (aerospace NDT, Singapore),
+    consumed by the LEADS Attendance Flutter app.
+
+    **Conventions**
+    - Every response uses an envelope. Success: `{ "success": true, "data": … }`.
+      Error: `{ "success": false, "error": { "code", "message", "details" } }`.
+    - Send `Authorization: Bearer <accessToken>` on every route except login, refresh,
+      forgot-password, reset-password and health.
+    - Timestamps are ISO-8601 UTC strings without milliseconds (`2026-10-16T00:54:00Z`); fields ending
+      in `Utc` are always UTC.
+    - Work dates are `YYYY-MM-DD` in the company timezone, `Asia/Singapore`.
+    - Durations are integer minutes. IDs are integers.
+    - Pagination: `?page=1&pageSize=20` (max 100); responses include `items, page, pageSize, total`.
+    - Endpoints that create a resource respond `201`; everything else succeeds with `200`.
+
+    **Real-time (Socket.IO)**: connect to namespace `/admin` with `auth: { token: <accessToken> }`
+    (ADMIN only; other roles get a `connect_error` of `FORBIDDEN`, missing/invalid tokens `UNAUTHORIZED`).
+    Server events:
+    - `attendance:updated`: one `LiveAttendanceRow`
+    - `overview:updated`: an `Overview`
+    - `task:updated`: a `TaskSummaryWithAssignee` (with `deleted: true` when the task was deleted)
+servers:
+  - url: http://localhost:4000/api/v1
+    description: Local development
+tags:
+  - name: Health
+  - name: Auth
+  - name: Me
+  - name: Attendance
+  - name: Tasks
+  - name: Files
+  - name: Announcements
+  - name: Admin
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: Liveness and database connectivity
+      security: []
+      responses:
+        '200':
+          description: API and database are up
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          status: { type: string, const: ok }
+                          database: { type: string, const: up }
+                          timeUtc: { type: string, format: date-time }
+        '503':
+          description: Database unreachable (code `SERVICE_UNAVAILABLE`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  # ---------------------------------------------------------------- Auth
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Sign in with email and password
+      description: |
+        Rate limited to 5 attempts per 15 minutes per IP + email (`429 RATE_LIMITED`).
+        Unknown email, wrong password and inactive accounts all return the same `INVALID_CREDENTIALS`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, example: mark.tan@leads-ndt.com }
+                password: { type: string, example: 'Leads@123' }
+      responses:
+        '200':
+          description: Signed in
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        required: [accessToken, refreshToken, user]
+                        properties:
+                          accessToken: { type: string }
+                          refreshToken: { type: string }
+                          user: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/InvalidCredentials' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshTokens
+      summary: Exchange a refresh token for a new token pair
+      description: |
+        Rotates the refresh token: the presented one is revoked and a new one issued.
+        Presenting an already-rotated or revoked token revokes every refresh token the user holds.
+        Expired refresh tokens return `TOKEN_EXPIRED`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshTokenBody' }
+      responses:
+        '200':
+          description: New token pair
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { $ref: '#/components/schemas/TokenPair' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Revoke a refresh token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshTokenBody' }
+      responses:
+        '200': { $ref: '#/components/responses/Empty' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/forgot-password:
+    post:
+      tags: [Auth]
+      operationId: forgotPassword
+      summary: Email a password reset link
+      description: |
+        Always returns 200 and never reveals whether the email exists. The link is valid for 1 hour and
+        is logged to the server console when SMTP isn't configured. Rate limited like login.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '200': { $ref: '#/components/responses/Empty' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/reset-password:
+    post:
+      tags: [Auth]
+      operationId: resetPassword
+      summary: Set a new password using a reset token
+      description: |
+        Single use. Signs the user out of every device. An invalid, used or expired token returns
+        `400 VALIDATION_ERROR` with field `token`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, newPassword]
+              properties:
+                token: { type: string }
+                newPassword:
+                  type: string
+                  minLength: 8
+                  maxLength: 128
+                  description: At least 8 characters, with at least one letter and one number.
+      responses:
+        '200': { $ref: '#/components/responses/Empty' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+
+  # ---------------------------------------------------------------- Me
+  /me:
+    get:
+      tags: [Me]
+      operationId: getMe
+      summary: Current user profile
+      responses:
+        '200':
+          description: The signed-in user
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /me/device-token:
+    post:
+      tags: [Me]
+      operationId: registerDeviceToken
+      summary: Register this device for push notifications
+      description: Upserts by token; a token previously registered to another account is reassigned.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fcmToken, platform]
+              properties:
+                fcmToken: { type: string, minLength: 10, maxLength: 512 }
+                platform: { type: string, enum: [android, ios] }
+      responses:
+        '200': { $ref: '#/components/responses/Empty' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /me/today:
+    get:
+      tags: [Me, Attendance]
+      operationId: getToday
+      summary: Home screen data (EMPLOYEE)
+      responses:
+        '200':
+          description: Today's office, attendance status and task summary
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        required: [date, office, attendance, tasks]
+                        properties:
+                          date: { $ref: '#/components/schemas/WorkDate' }
+                          office: { $ref: '#/components/schemas/Office' }
+                          attendance:
+                            type: object
+                            required: [status, record]
+                            properties:
+                              status: { $ref: '#/components/schemas/AttendanceStatus' }
+                              record:
+                                oneOf:
+                                  - $ref: '#/components/schemas/Attendance'
+                                  - type: 'null'
+                          tasks:
+                            type: object
+                            required: [total, completed, preview]
+                            properties:
+                              total: { type: integer }
+                              completed: { type: integer }
+                              preview:
+                                type: array
+                                maxItems: 3
+                                description: Not-completed tasks first (IN_PROGRESS, then TODO/CARRIED_OVER by due time).
+                                items: { $ref: '#/components/schemas/TaskSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ---------------------------------------------------------------- Attendance
+  /attendance/clock-in:
+    post:
+      tags: [Attendance]
+      operationId: clockIn
+      summary: Clock in from inside the office geofence (EMPLOYEE)
+      description: |
+        Validated server-side in this order: `MOCK_LOCATION` (isMocked=true), `LOW_ACCURACY`
+        (accuracy > MAX_GPS_ACCURACY_METERS), `OUTSIDE_GEOFENCE` (haversine distance to the user's office >
+        radius). Only one open shift and one shift per work date are allowed (`ALREADY_CLOCKED_IN`).
+        Lateness is computed on the server: late when clock-in is strictly after work date + shift start +
+        LATE_GRACE_MINUTES (Singapore time).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LocationFix' }
+      responses:
+        '201':
+          description: Clocked in
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { $ref: '#/components/schemas/Attendance' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: "`ALREADY_CLOCKED_IN`: an open shift exists, or today's shift is already complete"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '422': { $ref: '#/components/responses/LocationRejected' }
+
+  /attendance/current:
+    get:
+      tags: [Attendance]
+      operationId: getCurrentShift
+      summary: The open shift, for the Daily Work Report screen (EMPLOYEE)
+      responses:
+        '200':
+          description: Open shift
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        required: [attendance, elapsedMinutes, tasks]
+                        properties:
+                          attendance: { $ref: '#/components/schemas/Attendance' }
+                          elapsedMinutes: { type: integer }
+                          tasks:
+                            type: array
+                            description: Tasks due on the shift's work date.
+                            items: { $ref: '#/components/schemas/TaskSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NoOpenShift' }
+
+  /attendance/clock-out:
+    post:
+      tags: [Attendance]
+      operationId: clockOut
+      summary: Submit the daily report and clock out (EMPLOYEE)
+      description: |
+        Atomic: the report insert, task carry-over and shift close commit together or not at all.
+        The location is always recorded; `MOCK_LOCATION` and `LOW_ACCURACY` are always enforced, the geofence
+        only when `CLOCK_OUT_REQUIRES_GEOFENCE=true`. Each task in `carryOverTaskIds` must belong to the caller
+        (`403 FORBIDDEN`) and not be COMPLETED (`400 VALIDATION_ERROR`); it becomes `CARRIED_OVER` and its due
+        time moves to the same local time on the next work day (Mon–Fri).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/LocationFix'
+                - type: object
+                  required: [summary]
+                  properties:
+                    summary: { type: string, minLength: 1, maxLength: 2000 }
+                    blockers: { type: [string, 'null'], maxLength: 2000 }
+                    notes: { type: [string, 'null'], maxLength: 2000 }
+                    carryOverTaskIds:
+                      type: array
+                      items: { type: integer }
+                      default: []
+      responses:
+        '200':
+          description: Clocked out
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        required: [attendance, reportId]
+                        properties:
+                          attendance: { $ref: '#/components/schemas/Attendance' }
+                          reportId: { type: integer }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NoOpenShift' }
+        '422': { $ref: '#/components/responses/LocationRejected' }
+
+  /attendance/history:
+    get:
+      tags: [Attendance]
+      operationId: getAttendanceHistory
+      summary: Monthly attendance history (EMPLOYEE)
+      parameters:
+        - name: month
+          in: query
+          description: '`YYYY-MM`; defaults to the current month in Singapore time.'
+          schema: { type: string, pattern: '^\d{4}-(0[1-9]|1[0-2])$', example: '2026-10' }
+      responses:
+        '200':
+          description: History, newest first
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        required: [month, stats, days]
+                        properties:
+                          month: { type: string, example: '2026-10' }
+                          stats:
+                            type: object
+                            required: [avgMinutes, taskCompletionRate]
+                            properties:
+                              avgMinutes:
+                                type: integer
+                                description: Average duration of closed shifts in the month.
+                              taskCompletionRate:
+                                type: integer
+                                minimum: 0
+                                maximum: 100
+                                description: Completed ÷ total tasks due in the month × 100, rounded.
+                          days:
+                            type: array
+                            items: { $ref: '#/components/schemas/HistoryDay' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ---------------------------------------------------------------- Tasks
+  /tasks:
+    get:
+      tags: [Tasks]
+      operationId: listMyTasks
+      summary: Own tasks due on a date (EMPLOYEE)
+      description: Ordered IN_PROGRESS, then TODO/CARRIED_OVER by due time, then COMPLETED.
+      parameters:
+        - name: date
+          in: query
+          description: Defaults to today (Singapore).
+          schema: { $ref: '#/components/schemas/WorkDate' }
+      responses:
+        '200':
+          description: Tasks for the date
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        required: [date, completed, total, items]
+                        properties:
+                          date: { $ref: '#/components/schemas/WorkDate' }
+                          completed: { type: integer }
+                          total: { type: integer }
+                          items:
+                            type: array
+                            items: { $ref: '#/components/schemas/TaskSummary' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /tasks/{id}:
+    get:
+      tags: [Tasks]
+      operationId: getTask
+      summary: Task detail (EMPLOYEE own, or ADMIN)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { $ref: '#/components/responses/Task' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /tasks/{id}/status:
+    patch:
+      tags: [Tasks]
+      operationId: updateTaskStatus
+      summary: Advance a task (EMPLOYEE own)
+      description: |
+        Allowed moves: TODO → IN_PROGRESS, CARRIED_OVER → IN_PROGRESS, IN_PROGRESS → COMPLETED.
+        Anything else is `400 VALIDATION_ERROR`. Completing sets `completedUtc`.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [IN_PROGRESS, COMPLETED] }
+      responses:
+        '200': { $ref: '#/components/responses/Task' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /tasks/{id}/attachments:
+    post:
+      tags: [Tasks]
+      operationId: uploadTaskAttachment
+      summary: Upload an inspection report to a task (EMPLOYEE own)
+      description: One file in field `file`. pdf, jpg/jpeg, png, docx or xlsx; max MAX_UPLOAD_MB (10 MB). The extension, MIME type and file signature must all agree.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '201':
+          description: Uploaded
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { $ref: '#/components/schemas/Attachment' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /files/{id}:
+    get:
+      tags: [Files]
+      operationId: downloadFile
+      summary: Download an attachment (task assignee, uploader, or ADMIN)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Attachment id
+          schema: { type: integer }
+      responses:
+        '200':
+          description: The file, with its stored Content-Type
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- Announcements
+  /announcements:
+    get:
+      tags: [Announcements]
+      operationId: listAnnouncements
+      summary: Pinned announcements plus a paginated list of the rest
+      parameters:
+        - name: category
+          in: query
+          description: Omit (or leave empty) for all categories.
+          schema: { $ref: '#/components/schemas/AnnouncementCategory' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Newest first
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        required: [pinned, items, page, pageSize, total]
+                        properties:
+                          pinned:
+                            type: array
+                            items: { $ref: '#/components/schemas/Announcement' }
+                          items:
+                            type: array
+                            description: Excludes pinned announcements.
+                            items: { $ref: '#/components/schemas/Announcement' }
+                          page: { type: integer }
+                          pageSize: { type: integer }
+                          total: { type: integer, description: Total unpinned announcements. }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /announcements/{id}:
+    get:
+      tags: [Announcements]
+      operationId: getAnnouncement
+      summary: One announcement
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { $ref: '#/components/responses/Announcement' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- Admin: tasks
+  /admin/tasks:
+    post:
+      tags: [Admin]
+      operationId: adminCreateTask
+      summary: Create and assign a task
+      description: '`dueDate` + `dueTime` are Singapore local time. `notify: true` pushes to the assignee.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, assigneeId, priority, dueDate, dueTime]
+              properties:
+                title: { type: string, minLength: 1, maxLength: 200 }
+                description: { type: string, maxLength: 4000, default: '' }
+                assigneeId: { type: integer, description: Must be an active EMPLOYEE. }
+                priority: { $ref: '#/components/schemas/Priority' }
+                dueDate: { $ref: '#/components/schemas/WorkDate' }
+                dueTime: { type: string, pattern: '^([01]\d|2[0-3]):[0-5]\d$', example: '17:00' }
+                notify: { type: boolean, default: false }
+      responses:
+        '201': { $ref: '#/components/responses/TaskCreated' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    get:
+      tags: [Admin]
+      operationId: adminListTasks
+      summary: All tasks, filtered and paginated
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/TaskStatus' }
+        - name: assigneeId
+          in: query
+          schema: { type: integer }
+        - name: date
+          in: query
+          description: Due work date.
+          schema: { $ref: '#/components/schemas/WorkDate' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Newest due first
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        allOf:
+                          - $ref: '#/components/schemas/PageMeta'
+                          - properties:
+                              items:
+                                type: array
+                                items: { $ref: '#/components/schemas/TaskSummaryWithAssignee' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/tasks/stats:
+    get:
+      tags: [Admin]
+      operationId: adminTaskStats
+      summary: Pending vs completed task counts
+      responses:
+        '200':
+          description: pending = TODO + IN_PROGRESS + CARRIED_OVER
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        required: [pending, completed]
+                        properties:
+                          pending: { type: integer }
+                          completed: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/tasks/{id}:
+    patch:
+      tags: [Admin]
+      operationId: adminUpdateTask
+      summary: Update any of the create fields
+      description: Changing only `dueDate` or only `dueTime` keeps the other half. `notify` pushes to the (new) assignee.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                title: { type: string, minLength: 1, maxLength: 200 }
+                description: { type: string, maxLength: 4000 }
+                assigneeId: { type: integer }
+                priority: { $ref: '#/components/schemas/Priority' }
+                dueDate: { $ref: '#/components/schemas/WorkDate' }
+                dueTime: { type: string, pattern: '^([01]\d|2[0-3]):[0-5]\d$' }
+                notify: { type: boolean }
+      responses:
+        '200': { $ref: '#/components/responses/Task' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Admin]
+      operationId: adminDeleteTask
+      summary: Delete a task and its attachments
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { $ref: '#/components/responses/Empty' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- Admin: announcements
+  /admin/announcements:
+    post:
+      tags: [Admin]
+      operationId: adminCreateAnnouncement
+      summary: Post an announcement
+      description: '`notify: true` pushes to every active user.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, body, category]
+              properties:
+                title: { type: string, minLength: 1, maxLength: 200 }
+                body: { type: string, minLength: 1, maxLength: 20000 }
+                category: { $ref: '#/components/schemas/AnnouncementCategory' }
+                isPinned: { type: boolean, default: false }
+                notify: { type: boolean, default: false }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { $ref: '#/components/schemas/Announcement' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/announcements/{id}:
+    patch:
+      tags: [Admin]
+      operationId: adminUpdateAnnouncement
+      summary: Partially update an announcement
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                title: { type: string, minLength: 1, maxLength: 200 }
+                body: { type: string, minLength: 1, maxLength: 20000 }
+                category: { $ref: '#/components/schemas/AnnouncementCategory' }
+                isPinned: { type: boolean }
+                notify: { type: boolean }
+      responses:
+        '200': { $ref: '#/components/responses/Announcement' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Admin]
+      operationId: adminDeleteAnnouncement
+      summary: Soft-delete an announcement
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { $ref: '#/components/responses/Empty' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- Admin: dashboard & people
+  /admin/overview:
+    get:
+      tags: [Admin]
+      operationId: adminGetOverview
+      summary: Today's dashboard figures (Singapore time)
+      responses:
+        '200':
+          description: Overview
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { $ref: '#/components/schemas/Overview' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/attendance/live:
+    get:
+      tags: [Admin]
+      operationId: adminGetLiveAttendance
+      summary: Live status of every active employee, by name
+      responses:
+        '200':
+          description: Live rows
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/LiveAttendanceRow' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/users:
+    get:
+      tags: [Admin]
+      operationId: adminListUsers
+      summary: Active users (assignee dropdown)
+      parameters:
+        - name: role
+          in: query
+          schema: { $ref: '#/components/schemas/Role' }
+      responses:
+        '200':
+          description: Sorted by name
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: array
+                        items:
+                          type: object
+                          required: [id, name, initials, role]
+                          properties:
+                            id: { type: integer }
+                            name: { type: string }
+                            initials: { type: string }
+                            role: { $ref: '#/components/schemas/Role' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/attendance/manual:
+    post:
+      tags: [Admin]
+      operationId: adminAddManualAttendance
+      summary: Add a manual attendance correction
+      description: |
+        Method `MANUAL`; lateness is recomputed from the user's shift start. `clockInUtc` must fall on
+        `workDate` in Singapore time and may not be in the future. Fails with `409 ALREADY_CLOCKED_IN` if the
+        user already has a record for that date (or an open shift when `clockOutUtc` is null).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId, workDate, clockInUtc, reason]
+              properties:
+                userId: { type: integer }
+                workDate: { $ref: '#/components/schemas/WorkDate' }
+                clockInUtc: { type: string, format: date-time }
+                clockOutUtc: { type: [string, 'null'], format: date-time }
+                reason: { type: string, minLength: 1, maxLength: 500 }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { $ref: '#/components/schemas/Attendance' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: '`ALREADY_CLOCKED_IN`: overlaps an existing record'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /admin/reports:
+    get:
+      tags: [Admin]
+      operationId: adminListReports
+      summary: Daily work reports for a date
+      parameters:
+        - name: date
+          in: query
+          description: Defaults to today (Singapore).
+          schema: { $ref: '#/components/schemas/WorkDate' }
+      responses:
+        '200':
+          description: Newest first
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/DailyReport' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/leaves:
+    post:
+      tags: [Admin]
+      operationId: adminCreateLeave
+      summary: Record leave for an employee
+      description: Rejects ranges that overlap an existing leave for the same user (`400 VALIDATION_ERROR`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId, fromDate, toDate, reason]
+              properties:
+                userId: { type: integer }
+                fromDate: { $ref: '#/components/schemas/WorkDate' }
+                toDate: { $ref: '#/components/schemas/WorkDate' }
+                reason: { type: string, minLength: 1, maxLength: 500 }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { $ref: '#/components/schemas/Leave' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    get:
+      tags: [Admin]
+      operationId: adminListLeaves
+      summary: Leaves covering a date
+      parameters:
+        - name: date
+          in: query
+          description: Defaults to today (Singapore).
+          schema: { $ref: '#/components/schemas/WorkDate' }
+      responses:
+        '200':
+          description: Leaves
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Leave' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 'Access token from /auth/login or /auth/refresh. Claims: `{ sub, role }`. Lifetime JWT_ACCESS_TTL (15m).'
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: pageSize
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+
+  schemas:
+    SuccessEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, const: true }
+        data: {}
+
+    ErrorEnvelope:
+      type: object
+      required: [success, error]
+      properties:
+        success: { type: boolean, const: false }
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code:
+              type: string
+              enum:
+                - VALIDATION_ERROR
+                - INVALID_CREDENTIALS
+                - TOKEN_EXPIRED
+                - UNAUTHORIZED
+                - FORBIDDEN
+                - NOT_FOUND
+                - NO_OPEN_SHIFT
+                - ALREADY_CLOCKED_IN
+                - OUTSIDE_GEOFENCE
+                - LOW_ACCURACY
+                - MOCK_LOCATION
+                - RATE_LIMITED
+                - INTERNAL_ERROR
+                - SERVICE_UNAVAILABLE
+            message: { type: string }
+            details:
+              type: object
+              description: |
+                VALIDATION_ERROR: `{ fields: [{ field, message }] }`.
+                OUTSIDE_GEOFENCE: `{ distanceMeters, radiusMeters }`.
+                LOW_ACCURACY: `{ accuracy, maxAccuracy }`. Otherwise usually `{}`.
+
+    WorkDate:
+      type: string
+      format: date
+      description: Calendar date in Asia/Singapore.
+      example: '2026-10-16'
+
+    Role: { type: string, enum: [EMPLOYEE, ADMIN] }
+    AttendanceStatus: { type: string, enum: [NOT_CLOCKED_IN, CLOCKED_IN, CLOCKED_OUT] }
+    AttendanceMethod: { type: string, enum: [GEOFENCE, MANUAL] }
+    LiveStatus: { type: string, enum: [IN_OFFICE, LATE, ON_LEAVE, ABSENT, CLOCKED_OUT] }
+    TaskStatus: { type: string, enum: [TODO, IN_PROGRESS, COMPLETED, CARRIED_OVER] }
+    Priority: { type: string, enum: [LOW, MEDIUM, HIGH] }
+    AnnouncementCategory: { type: string, enum: [SAFETY, GENERAL, EVENTS] }
+
+    TokenPair:
+      type: object
+      required: [accessToken, refreshToken]
+      properties:
+        accessToken: { type: string }
+        refreshToken: { type: string }
+
+    RefreshTokenBody:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken: { type: string }
+
+    PageMeta:
+      type: object
+      required: [items, page, pageSize, total]
+      properties:
+        items: { type: array, items: {} }
+        page: { type: integer }
+        pageSize: { type: integer }
+        total: { type: integer }
+
+    UserRef:
+      type: object
+      required: [id, name, initials]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        initials: { type: string, example: MT }
+
+    User:
+      type: object
+      required: [id, name, email, role, initials, shiftStart, officeId]
+      properties:
+        id: { type: integer, example: 1 }
+        name: { type: string, example: Mark Tan }
+        email: { type: string, format: email, example: mark.tan@leads-ndt.com }
+        role: { $ref: '#/components/schemas/Role' }
+        initials: { type: string, example: MT }
+        shiftStart: { type: string, example: '09:00', description: 'HH:mm, Singapore time' }
+        officeId: { type: integer, example: 1 }
+
+    Office:
+      type: object
+      required: [id, name, address, latitude, longitude, radiusMeters]
+      properties:
+        id: { type: integer, example: 1 }
+        name: { type: string, example: LEADS Office Geofence }
+        address: { type: string, example: '123 Aerospace Tech Park, Singapore' }
+        latitude: { type: number, example: 1.417 }
+        longitude: { type: number, example: 103.868 }
+        radiusMeters: { type: integer, example: 150 }
+
+    LocationFix:
+      type: object
+      required: [latitude, longitude, accuracy, isMocked]
+      properties:
+        latitude: { type: number, minimum: -90, maximum: 90 }
+        longitude: { type: number, minimum: -180, maximum: 180 }
+        accuracy: { type: number, minimum: 0, description: Horizontal accuracy in meters. }
+        isMocked: { type: boolean }
+
+    Attendance:
+      type: object
+      required:
+        [id, workDate, clockInUtc, clockOutUtc, durationMinutes, method, isLate, clockInDistanceMeters]
+      properties:
+        id: { type: integer, example: 10 }
+        workDate: { $ref: '#/components/schemas/WorkDate' }
+        clockInUtc: { type: string, format: date-time }
+        clockOutUtc: { type: [string, 'null'], format: date-time }
+        durationMinutes:
+          { type: [integer, 'null'], description: 'DATEDIFF(MINUTE, in, out); null while open.' }
+        method: { $ref: '#/components/schemas/AttendanceMethod' }
+        isLate: { type: boolean }
+        clockInDistanceMeters:
+          type: [integer, 'null']
+          description: Server-computed distance from the office at clock-in; null for MANUAL records.
+          example: 42
+
+    HistoryDay:
+      type: object
+      required:
+        [workDate, clockInUtc, clockOutUtc, durationMinutes, method, isLate, tasksCompleted, tasksTotal]
+      properties:
+        workDate: { $ref: '#/components/schemas/WorkDate' }
+        clockInUtc: { type: string, format: date-time }
+        clockOutUtc: { type: [string, 'null'], format: date-time }
+        durationMinutes: { type: [integer, 'null'] }
+        method: { $ref: '#/components/schemas/AttendanceMethod' }
+        isLate: { type: boolean }
+        tasksCompleted: { type: integer }
+        tasksTotal: { type: integer }
+
+    TaskSummary:
+      type: object
+      required: [id, title, priority, status, dueUtc, attachmentCount]
+      properties:
+        id: { type: integer, example: 5 }
+        title: { type: string, example: 'Client follow-up: SIA Engineering' }
+        priority: { $ref: '#/components/schemas/Priority' }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        dueUtc: { type: string, format: date-time }
+        attachmentCount: { type: integer }
+
+    TaskSummaryWithAssignee:
+      allOf:
+        - $ref: '#/components/schemas/TaskSummary'
+        - type: object
+          required: [assignee]
+          properties:
+            assignee: { $ref: '#/components/schemas/UserRef' }
+
+    Attachment:
+      type: object
+      required: [id, fileName, url, uploadedUtc]
+      properties:
+        id: { type: integer }
+        fileName: { type: string, example: report.pdf }
+        url:
+          type: string
+          format: uri
+          description: Authenticated download URL (`GET /files/{id}` with the bearer token).
+        mimeType: { type: string, example: application/pdf }
+        sizeBytes: { type: integer }
+        uploadedUtc: { type: string, format: date-time }
+
+    Task:
+      allOf:
+        - $ref: '#/components/schemas/TaskSummaryWithAssignee'
+        - type: object
+          required: [description, createdBy, completedUtc, attachments]
+          properties:
+            description: { type: string }
+            createdBy:
+              type: object
+              required: [id, name]
+              properties:
+                id: { type: integer }
+                name: { type: string, example: Admin }
+            completedUtc: { type: [string, 'null'], format: date-time }
+            attachments:
+              type: array
+              items: { $ref: '#/components/schemas/Attachment' }
+
+    Announcement:
+      type: object
+      required: [id, title, body, category, isPinned, createdUtc, author]
+      properties:
+        id: { type: integer, example: 3 }
+        title: { type: string, example: Safety Briefing Tomorrow }
+        body: { type: string }
+        category: { $ref: '#/components/schemas/AnnouncementCategory' }
+        isPinned: { type: boolean }
+        createdUtc: { type: string, format: date-time }
+        author:
+          type: object
+          required: [id, name]
+          properties:
+            id: { type: integer }
+            name: { type: string }
+
+    Overview:
+      type: object
+      required:
+        [totalEmployees, inOffice, inOfficePct, late, onLeave, taskCompletionPct, taskCompletionDeltaPct]
+      properties:
+        totalEmployees: { type: integer, description: Active EMPLOYEE users. }
+        inOffice: { type: integer, description: Open shifts plus shifts already clocked out today. }
+        inOfficePct: { type: integer }
+        late:
+          type: object
+          required: [count, names]
+          properties:
+            count: { type: integer }
+            names: { type: array, items: { type: string } }
+        onLeave: { type: integer }
+        taskCompletionPct: { type: integer, description: Completed ÷ total tasks due today × 100. }
+        taskCompletionDeltaPct: { type: integer, description: Today's figure minus yesterday's. }
+
+    LiveAttendanceRow:
+      type: object
+      required: [user, status, clockInUtc]
+      properties:
+        user: { $ref: '#/components/schemas/UserRef' }
+        status: { $ref: '#/components/schemas/LiveStatus' }
+        clockInUtc: { type: [string, 'null'], format: date-time }
+
+    DailyReport:
+      type: object
+      required: [reportId, user, summary, blockers, notes, submittedUtc, durationMinutes]
+      properties:
+        reportId: { type: integer }
+        user: { $ref: '#/components/schemas/UserRef' }
+        summary: { type: string }
+        blockers: { type: [string, 'null'] }
+        notes: { type: [string, 'null'] }
+        submittedUtc: { type: string, format: date-time }
+        durationMinutes: { type: [integer, 'null'] }
+
+    Leave:
+      type: object
+      required: [id, userId, user, fromDate, toDate, reason, createdUtc, createdBy]
+      properties:
+        id: { type: integer }
+        userId: { type: integer }
+        user: { $ref: '#/components/schemas/UserRef' }
+        fromDate: { $ref: '#/components/schemas/WorkDate' }
+        toDate: { $ref: '#/components/schemas/WorkDate' }
+        reason: { type: string }
+        createdUtc: { type: string, format: date-time }
+        createdBy:
+          type: object
+          required: [id, name]
+          properties:
+            id: { type: integer }
+            name: { type: string }
+
+  responses:
+    Empty:
+      description: Success with an empty object
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success: { type: boolean, const: true }
+              data: { type: object, maxProperties: 0 }
+    Task:
+      description: Task detail
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data: { $ref: '#/components/schemas/Task' }
+    TaskCreated:
+      description: Task created
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data: { $ref: '#/components/schemas/Task' }
+    Announcement:
+      description: Announcement
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data: { $ref: '#/components/schemas/Announcement' }
+    ValidationError:
+      description: '`VALIDATION_ERROR`: body, query or params failed validation (`details.fields` lists them)'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            success: false
+            error:
+              code: VALIDATION_ERROR
+              message: Request validation failed
+              details:
+                fields:
+                  - { field: email, message: Invalid email }
+    InvalidCredentials:
+      description: '`INVALID_CREDENTIALS`'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Unauthorized:
+      description: '`UNAUTHORIZED` (missing/invalid token) or `TOKEN_EXPIRED`'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Forbidden:
+      description: '`FORBIDDEN`: wrong role, or not the owner of the resource'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    NotFound:
+      description: '`NOT_FOUND`'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    NoOpenShift:
+      description: '`NO_OPEN_SHIFT`: not clocked in'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    RateLimited:
+      description: '`RATE_LIMITED`'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    LocationRejected:
+      description: '`MOCK_LOCATION`, `LOW_ACCURACY` or `OUTSIDE_GEOFENCE`'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          examples:
+            outside:
+              value:
+                success: false
+                error:
+                  code: OUTSIDE_GEOFENCE
+                  message: You are outside the office geofence
+                  details: { distanceMeters: 212, radiusMeters: 150 }
+            accuracy:
+              value:
+                success: false
+                error:
+                  code: LOW_ACCURACY
+                  message: GPS accuracy is too low. Move to an open area and try again.
+                  details: { accuracy: 80, maxAccuracy: 50 }

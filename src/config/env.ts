@@ -16,7 +16,12 @@ const duration = z.string().regex(/^\d+[smhd]$/, 'must look like 15m, 12h or 30d
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
-  PORT: z.coerce.number().int().positive().default(4000),
+  // A TCP port, or a named pipe path when hosted by iisnode (e.g. \\.\pipe\…).
+  PORT: z
+    .string()
+    .default('4000')
+    .refine((v) => /^\d+$/.test(v) || v.startsWith('\\\\.\\pipe\\'), 'must be a port number or named pipe')
+    .transform((v) => (/^\d+$/.test(v) ? Number(v) : v)),
   PUBLIC_BASE_URL: z
     .string()
     .url()
