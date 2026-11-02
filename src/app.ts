@@ -6,6 +6,7 @@ import { env, isTest } from './config/env';
 import { errorHandler } from './middleware/errorHandler';
 import { notFound } from './middleware/notFound';
 import { adminRouter } from './modules/admin/admin.routes';
+import { announcementsRouter } from './modules/announcements/announcements.routes';
 import { attendanceRouter } from './modules/attendance/attendance.routes';
 import { createAuthRouter } from './modules/auth/auth.routes';
 import { healthRouter } from './modules/health/health.routes';
@@ -21,6 +22,7 @@ function apiRouter(): Router {
   router.use('/attendance', attendanceRouter);
   router.use('/tasks', tasksRouter);
   router.use('/files', filesRouter);
+  router.use('/announcements', announcementsRouter);
   router.use('/admin', adminRouter);
   return router;
 }
