@@ -2,6 +2,7 @@ import http from 'node:http';
 import { createApp } from './app';
 import { env } from './config/env';
 import { closePool, getPool } from './db/pool';
+import { createSocketServer } from './socket';
 import { logger } from './utils/logger';
 
 async function main() {
@@ -10,6 +11,7 @@ async function main() {
 
   const app = createApp();
   const server = http.createServer(app);
+  const io = createSocketServer(server);
 
   server.listen(env.PORT, () => {
     logger.info(`LEADS Attendance API listening on http://localhost:${env.PORT}/api/v1`);
@@ -20,6 +22,7 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ signal }, 'Shutting down');
+    void io.close();
     server.close(() => {
       closePool()
         .catch((err: unknown) => logger.error({ err }, 'Error closing DB pool'))
