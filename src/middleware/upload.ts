@@ -92,11 +92,10 @@ export function singleFileUpload(req: Request, res: Response, next: NextFunction
 }
 
 /** Strips any path and control characters from a client-supplied file name. */
+// eslint-disable-next-line no-control-regex
+const UNSAFE_FILENAME_CHARS = /[\u0000-\u001f\u007f"]/g;
+
 export function safeFileName(original: string): string {
-  // eslint-disable-next-line no-control-regex
-  const base = path
-    .basename(original.replace(/\\/g, '/'))
-    .replace(/[\u0000-\u001f\u007f"]/g, '')
-    .trim();
+  const base = path.basename(original.replace(/\\/g, '/')).replace(UNSAFE_FILENAME_CHARS, '').trim();
   return (base || 'file').slice(0, 255);
 }
