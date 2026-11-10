@@ -14,11 +14,15 @@
     "migrate": "tsx scripts/migrate.ts",
     "migrate:prod": "node dist/scripts/migrate.js",
     "seed": "tsx db/seed.ts",
+    "seed:prod": "node dist/db/seed.js",
+    "user:create": "tsx scripts/create-user.ts",
+    "user:create:prod": "node dist/scripts/create-user.js",
     "lint": "eslint . && prettier --check .",
     "format": "prettier --write .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "docs:postman": "tsx scripts/build-postman.ts && prettier --write --log-level warn docs/postman/LEADS-Attendance.postman_collection.json"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",

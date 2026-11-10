@@ -15,6 +15,8 @@ export interface RealtimeBuilders {
 
 let builders: RealtimeBuilders | null = null;
 
+export const userRoom = (userId: number) => `user:${userId}`;
+
 export function attachAdminNamespace(ns: Namespace, payloadBuilders: RealtimeBuilders): void {
   adminNs = ns;
   builders = payloadBuilders;
@@ -42,6 +44,26 @@ export const realtime = {
       }
       ns.emit('overview:updated', await b.overview());
     });
+  },
+
+  /** Emits `user:pending` when someone signs up and is waiting for approval. */
+  userPending(user: unknown): void {
+    run('user:pending', async (ns) => {
+      ns.emit('user:pending', user);
+    });
+  },
+
+  /** Emits `leave:updated` with the Leave whenever one is requested, reviewed, cancelled or withdrawn. */
+  leaveChanged(leave: unknown): void {
+    run('leave', async (ns) => {
+      ns.emit('leave:updated', leave);
+    });
+  },
+
+  /** Drops the dashboard connections of a user who lost admin access. */
+  disconnectUser(userId: number): void {
+    const ns = adminNs;
+    if (ns) ns.in(userRoom(userId)).disconnectSockets(true);
   },
 
   /** Emits `task:updated` with TaskSummary + assignee for each task, then a fresh overview. */

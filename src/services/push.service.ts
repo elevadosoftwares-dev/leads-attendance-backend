@@ -5,6 +5,7 @@ import { getMessaging, type BatchResponse, type MulticastMessage } from 'firebas
 import { env } from '../config/env';
 import type { Role } from '../modules/auth/auth.types';
 import * as devicesRepo from '../modules/devices/devices.repository';
+import type { DeviceToken } from '../modules/devices/devices.repository';
 import { logger } from '../utils/logger';
 
 export interface PushMessage {
@@ -55,14 +56,26 @@ export function setMessagingClient(next: MessagingClient | null | undefined): vo
   client = next;
 }
 
-async function sendToTokens(tokens: string[], message: PushMessage): Promise<void> {
+/**
+ * Android channels created by the app: the default one plays the notification sound, the silent one doesn't. iOS
+ * has no channels, so silent devices simply get no `sound`.
+ */
+export const ANDROID_CHANNEL = { sound: 'leads_default', silent: 'leads_silent' } as const;
+
+async function sendToDevices(devices: DeviceToken[], message: PushMessage): Promise<void> {
+  const tokens = (silent: boolean) => devices.filter((d) => d.silent === silent).map((d) => d.token);
+  await sendToTokens(tokens(false), message, false);
+  await sendToTokens(tokens(true), message, true);
+}
+
+async function sendToTokens(tokens: string[], message: PushMessage, silent: boolean): Promise<void> {
   const unique = [...new Set(tokens)];
   if (unique.length === 0) return;
 
   const messaging = getClient();
   if (!messaging) {
     logger.info(
-      { title: message.title, recipients: unique.length },
+      { title: message.title, recipients: unique.length, silent },
       'Push (disabled): would send notification',
     );
     return;
@@ -75,14 +88,19 @@ async function sendToTokens(tokens: string[], message: PushMessage): Promise<voi
       tokens: batch,
       notification: { title: message.title, body: message.body },
       data: message.data,
-      android: { priority: 'high' },
-      apns: { payload: { aps: { sound: 'default' } } },
+      android: {
+        priority: 'high',
+        notification: silent
+          ? { channelId: ANDROID_CHANNEL.silent, defaultSound: false, defaultVibrateTimings: false }
+          : { channelId: ANDROID_CHANNEL.sound, defaultSound: true },
+      },
+      apns: { payload: { aps: silent ? {} : { sound: 'default' } } },
     });
     response.responses.forEach((r, idx) => {
       if (!r.success && r.error && DEAD_TOKEN_CODES.has(r.error.code)) dead.push(batch[idx]!);
     });
     logger.info(
-      { title: message.title, success: response.successCount, failure: response.failureCount },
+      { title: message.title, success: response.successCount, failure: response.failureCount, silent },
       'Push notification sent',
     );
   }
@@ -105,13 +123,14 @@ function fireAndForget(label: string, work: () => Promise<void>): Promise<void> 
 export const pushService = {
   notifyUsers(userIds: number[], message: PushMessage): Promise<void> {
     return fireAndForget(message.title, async () =>
-      sendToTokens(await devicesRepo.listTokensForUsers(userIds), message),
+      sendToDevices(await devicesRepo.listTokensForUsers(userIds), message),
     );
   },
 
-  notifyAllActive(message: PushMessage, role?: Role): Promise<void> {
+  /** Every active user, or only those with one of `roles`. */
+  notifyAllActive(message: PushMessage, roles?: readonly Role[]): Promise<void> {
     return fireAndForget(message.title, async () =>
-      sendToTokens(await devicesRepo.listTokensForActiveUsers(role), message),
+      sendToDevices(await devicesRepo.listTokensForActiveUsers(roles), message),
     );
   },
 };

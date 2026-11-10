@@ -3,12 +3,14 @@ import { createApp } from './app';
 import { env } from './config/env';
 import { closePool, getPool } from './db/pool';
 import { startJobs } from './jobs';
+import { loadCompanyTimezone } from './modules/offices/offices.service';
 import { createSocketServer } from './socket';
 import { logger } from './utils/logger';
 
 async function main() {
   await getPool();
   logger.info({ database: env.DB_NAME, server: env.DB_SERVER }, 'Connected to SQL Server');
+  logger.info({ timezone: await loadCompanyTimezone() }, 'Company timezone');
 
   const app = createApp();
   const server = http.createServer(app);

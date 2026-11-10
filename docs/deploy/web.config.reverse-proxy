@@ -2,7 +2,9 @@
 <!--
   IIS as a reverse proxy in front of the Node service listening on localhost:4000.
   Requires: URL Rewrite, Application Request Routing (proxy enabled), WebSocket Protocol feature.
-  Rename to web.config in the IIS site root.
+  Put this file, renamed to web.config, alone in an empty folder and point the IIS site there. Never point the
+  site at the project folder: IIS could then serve files such as secrets/*.json directly.
+  Run Node with TRUST_PROXY=1, or every client shares the proxy's IP and therefore one login rate limit.
 -->
 <configuration>
   <system.webServer>
@@ -12,9 +14,6 @@
         <rule name="ReverseProxyToNode" stopProcessing="true">
           <match url="(.*)" />
           <action type="Rewrite" url="http://localhost:4000/{R:1}" />
-          <serverVariables>
-            <set name="HTTP_X_FORWARDED_PROTO" value="https" />
-          </serverVariables>
         </rule>
       </rules>
     </rewrite>

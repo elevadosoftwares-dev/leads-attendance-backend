@@ -9,7 +9,7 @@ info:
     **Conventions**
     - Every response uses an envelope. Success: `{ "success": true, "data": … }`.
       Error: `{ "success": false, "error": { "code", "message", "details" } }`.
-    - Send `Authorization: Bearer <accessToken>` on every route except login, refresh,
+    - Send `Authorization: Bearer <accessToken>` on every route except signup, login, refresh,
       forgot-password, reset-password and health.
     - Timestamps are ISO-8601 UTC strings without milliseconds (`2026-10-16T00:54:00Z`); fields ending
       in `Utc` are always UTC.
@@ -19,11 +19,26 @@ info:
     - Endpoints that create a resource respond `201`; everything else succeeds with `200`.
 
     **Real-time (Socket.IO)**: connect to namespace `/admin` with `auth: { token: <accessToken> }`
-    (ADMIN only; other roles get a `connect_error` of `FORBIDDEN`, missing/invalid tokens `UNAUTHORIZED`).
+    (ADMIN or SUPER_ADMIN; other roles get a `connect_error` of `FORBIDDEN`, missing/invalid tokens `UNAUTHORIZED`).
     Server events:
     - `attendance:updated`: one `LiveAttendanceRow`
     - `overview:updated`: an `Overview`
     - `task:updated`: a `TaskSummaryWithAssignee` (with `deleted: true` when the task was deleted)
+    - `user:pending`: `{ id, name, email, status: PENDING }` when someone signs up
+    - `leave:updated`: a `Leave` whenever one is recorded, requested, approved, rejected, cancelled or withdrawn
+
+    **Roles**
+    - `EMPLOYEE`: clocks in and out, works on tasks, reads announcements, requests leave.
+    - `ADMIN`: everything under `/admin` for employees: dashboard, tasks, announcements, attendance
+      corrections, leave (record, approve, reject, cancel), and employee accounts (create, approve or reject sign-ups, rename, remove, reactivate).
+    - `SUPER_ADMIN`: everything an admin can do, plus the only role that may change the office settings
+      (`PATCH /admin/office`: name, address, location, geofence radius, default shift start and end, late grace
+      minutes, timezone), set anyone's `shiftStart` and `shiftEnd`, and create, promote, demote or remove admins. There is exactly one, created by
+      `npm run seed`; it cannot be created, changed or removed through the API by anyone else.
+    - When an admin attempts a super-admin-only action the API answers `403 FORBIDDEN`.
+
+    **Accounts**: users are `PENDING` (signed up, awaiting approval), `ACTIVE`, or `INACTIVE` (removed).
+    Removing or demoting a user takes effect immediately, including on access tokens already issued.
 servers:
   - url: http://localhost:4000/api/v1
     description: Local development
@@ -76,7 +91,8 @@ paths:
       summary: Sign in with email and password
       description: |
         Rate limited to 5 attempts per 15 minutes per IP + email (`429 RATE_LIMITED`).
-        Unknown email, wrong password and inactive accounts all return the same `INVALID_CREDENTIALS`.
+        Unknown email and wrong password return the same `INVALID_CREDENTIALS`. Only when the password is right
+        does the account state show: `403 ACCOUNT_PENDING` (awaiting approval) or `403 ACCOUNT_INACTIVE` (removed).
       security: []
       requestBody:
         required: true
@@ -87,7 +103,7 @@ paths:
               required: [email, password]
               properties:
                 email: { type: string, format: email, example: mark.tan@leads-ndt.com }
-                password: { type: string, example: 'Leads@123' }
+                password: { type: string, example: 'Welcome123' }
       responses:
         '200':
           description: Signed in
@@ -106,6 +122,55 @@ paths:
                           user: { $ref: '#/components/schemas/User' }
         '400': { $ref: '#/components/responses/ValidationError' }
         '401': { $ref: '#/components/responses/InvalidCredentials' }
+        '403': { $ref: '#/components/responses/AccountBlocked' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/signup:
+    post:
+      tags: [Auth]
+      operationId: signup
+      summary: Employee self sign-up (waits for admin approval)
+      description: |
+        Creates an `EMPLOYEE` account with status `PENDING`. It cannot log in (`403 ACCOUNT_PENDING`) until an
+        admin approves it with `POST /admin/users/{id}/approve`. Admin accounts can never be created here; any
+        `role` in the body is ignored. Active admins get a `USER_PENDING` push and a `user:pending` socket event.
+        Rate limited to 5 per 15 minutes per IP + email and 20 per hour per IP (`429 RATE_LIMITED`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password]
+              properties:
+                name: { type: string, minLength: 2, maxLength: 150, example: Jane Lim }
+                email: { type: string, format: email, example: jane.lim@leads-ndt.com }
+                password:
+                  type: string
+                  minLength: 8
+                  maxLength: 128
+                  description: At least one letter and one number.
+                  example: 'Welcome123'
+      responses:
+        '201':
+          description: Sign-up received, waiting for approval
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        required: [id, name, email, status]
+                        properties:
+                          id: { type: integer }
+                          name: { type: string }
+                          email: { type: string }
+                          status: { type: string, const: PENDING }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409': { $ref: '#/components/responses/EmailTaken' }
         '429': { $ref: '#/components/responses/RateLimited' }
 
   /auth/refresh:
@@ -235,9 +300,46 @@ paths:
               properties:
                 fcmToken: { type: string, minLength: 10, maxLength: 512 }
                 platform: { type: string, enum: [android, ios] }
+                silent:
+                  type: boolean
+                  default: false
+                  description: >-
+                    Deliver this device's notifications without sound (Android channel `leads_silent`, no iOS sound).
+                    Send again with the new value when the user changes the setting.
       responses:
         '200': { $ref: '#/components/responses/Empty' }
         '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /me/change-password:
+    post:
+      tags: [Me]
+      operationId: changePassword
+      summary: Change your own password
+      description: Every refresh token is revoked, so other devices must sign in again (the current access token keeps working until it expires).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword: { type: string }
+                newPassword:
+                  {
+                    type: string,
+                    minLength: 8,
+                    maxLength: 128,
+                    description: At least one letter and one number.,
+                  }
+      responses:
+        '200': { $ref: '#/components/responses/Empty' }
+        '400':
+          description: '`VALIDATION_ERROR`: weak new password, or `currentPassword` is incorrect'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /me/today:
@@ -284,6 +386,54 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
 
   # ---------------------------------------------------------------- Attendance
+  /me/leaves:
+    get:
+      tags: [Me]
+      operationId: listMyLeaves
+      summary: My leave, newest first (EMPLOYEE)
+      responses:
+        '200': { $ref: '#/components/responses/LeaveList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Me]
+      operationId: requestLeave
+      summary: Request leave (EMPLOYEE)
+      description: |
+        Creates a `PENDING` leave from today onward; it counts once an admin approves it. Active admins get a
+        `LEAVE_REQUEST` push and a `leave:updated` socket event. Ranges overlapping pending or approved leave are
+        rejected (`400 VALIDATION_ERROR`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fromDate, toDate, reason]
+              properties:
+                fromDate: { $ref: '#/components/schemas/WorkDate' }
+                toDate: { $ref: '#/components/schemas/WorkDate' }
+                reason: { type: string, minLength: 1, maxLength: 500 }
+      responses:
+        '201': { $ref: '#/components/responses/LeaveCreated' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /me/leaves/{id}/withdraw:
+    post:
+      tags: [Me]
+      operationId: withdrawLeave
+      summary: Withdraw my pending leave, or approved leave that hasn't started (EMPLOYEE)
+      description: Sets `CANCELLED`. Approved leave that has started can only be cancelled by an admin.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { $ref: '#/components/responses/LeaveOne' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /attendance/clock-in:
     post:
       tags: [Attendance]
@@ -294,7 +444,7 @@ paths:
         (accuracy > MAX_GPS_ACCURACY_METERS), `OUTSIDE_GEOFENCE` (haversine distance to the user's office >
         radius). Only one open shift and one shift per work date are allowed (`ALREADY_CLOCKED_IN`).
         Lateness is computed on the server: late when clock-in is strictly after work date + shift start +
-        LATE_GRACE_MINUTES (Singapore time).
+        the office's `lateGraceMinutes` (Singapore time; set by the super admin).
       requestBody:
         required: true
         content:
@@ -418,7 +568,7 @@ paths:
                   - properties:
                       data:
                         type: object
-                        required: [month, stats, days]
+                        required: [month, stats, days, leaves]
                         properties:
                           month: { type: string, example: '2026-10' }
                           stats:
@@ -436,6 +586,17 @@ paths:
                           days:
                             type: array
                             items: { $ref: '#/components/schemas/HistoryDay' }
+                          leaves:
+                            type: array
+                            description: Approved leave overlapping the month.
+                            items:
+                              type: object
+                              required: [id, fromDate, toDate, reason]
+                              properties:
+                                id: { type: integer }
+                                fromDate: { $ref: '#/components/schemas/WorkDate' }
+                                toDate: { $ref: '#/components/schemas/WorkDate' }
+                                reason: { type: string }
         '400': { $ref: '#/components/responses/ValidationError' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -620,7 +781,7 @@ paths:
       tags: [Admin]
       operationId: adminCreateTask
       summary: Create and assign a task
-      description: '`dueDate` + `dueTime` are Singapore local time. `notify: true` pushes to the assignee.'
+      description: '`dueDate` + `dueTime` are company-timezone local time. The assignee always gets a "New task assigned" push.'
       requestBody:
         required: true
         content:
@@ -635,7 +796,8 @@ paths:
                 priority: { $ref: '#/components/schemas/Priority' }
                 dueDate: { $ref: '#/components/schemas/WorkDate' }
                 dueTime: { type: string, pattern: '^([01]\d|2[0-3]):[0-5]\d$', example: '17:00' }
-                notify: { type: boolean, default: false }
+                notify:
+                  { type: boolean, deprecated: true, description: Ignored; the assignee is always notified. }
       responses:
         '201': { $ref: '#/components/responses/TaskCreated' }
         '400': { $ref: '#/components/responses/ValidationError' }
@@ -706,7 +868,9 @@ paths:
       tags: [Admin]
       operationId: adminUpdateTask
       summary: Update any of the create fields
-      description: Changing only `dueDate` or only `dueTime` keeps the other half. `notify` pushes to the (new) assignee.
+      description: >-
+        Changing only `dueDate` or only `dueTime` keeps the other half. A new assignee always gets a "New task
+        assigned" push; for other changes `notify: true` sends the assignee "Task updated".
       parameters: [{ $ref: '#/components/parameters/Id' }]
       requestBody:
         required: true
@@ -853,11 +1017,15 @@ paths:
     get:
       tags: [Admin]
       operationId: adminListUsers
-      summary: Active users (assignee dropdown)
+      summary: Users by status (default ACTIVE, which feeds the assignee dropdown)
+      description: '`status=PENDING` lists sign-ups awaiting approval; `status=INACTIVE` lists removed users.'
       parameters:
         - name: role
           in: query
           schema: { $ref: '#/components/schemas/Role' }
+        - name: status
+          in: query
+          schema: { allOf: [{ $ref: '#/components/schemas/UserStatus' }], default: ACTIVE }
       responses:
         '200':
           description: Sorted by name
@@ -869,14 +1037,213 @@ paths:
                   - properties:
                       data:
                         type: array
-                        items:
-                          type: object
-                          required: [id, name, initials, role]
-                          properties:
-                            id: { type: integer }
-                            name: { type: string }
-                            initials: { type: string }
-                            role: { $ref: '#/components/schemas/Role' }
+                        items: { $ref: '#/components/schemas/AdminUser' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Admin]
+      operationId: adminCreateUser
+      summary: Create an active employee or admin
+      description: |
+        The account can log in immediately with the password you set; tell the user, and they can change it with
+        `POST /me/change-password`. Admins may create `EMPLOYEE` accounts; only the super admin may create `ADMIN`
+        accounts or pass `shiftStart` / `shiftEnd` (otherwise `403 FORBIDDEN`). Missing times default to the
+        office's; the end must be later than the start.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password, role]
+              properties:
+                name: { type: string, minLength: 2, maxLength: 150 }
+                email: { type: string, format: email }
+                password:
+                  {
+                    type: string,
+                    minLength: 8,
+                    maxLength: 128,
+                    description: At least one letter and one number.,
+                  }
+                role: { $ref: '#/components/schemas/AssignableRole' }
+                shiftStart:
+                  {
+                    type: string,
+                    pattern: '^([01]\d|2[0-3]):[0-5]\d$',
+                    description: Super admin only. Defaults to the office defaultShiftStart.,
+                  }
+                shiftEnd:
+                  {
+                    type: string,
+                    pattern: '^([01]\d|2[0-3]):[0-5]\d$',
+                    description: Super admin only. Defaults to the office defaultShiftEnd.,
+                  }
+      responses:
+        '201': { $ref: '#/components/responses/AdminUser' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/EmailTaken' }
+
+  /admin/users/{id}:
+    patch:
+      tags: [Admin]
+      operationId: adminUpdateUser
+      summary: Rename, change shift times, or promote/demote
+      description: |
+        Admins may rename employees (and themselves). Only the super admin may change `role`, `shiftStart` or
+        `shiftEnd` (which must stay later than the start), or edit
+        an admin account; the super admin account can only be renamed by itself (`403 FORBIDDEN` otherwise).
+        Nobody changes their own role (`400 VALIDATION_ERROR`). Role changes apply at once, even to tokens already
+        issued, and demoted admins are disconnected from `/admin`.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                name: { type: string, minLength: 2, maxLength: 150 }
+                role: { $ref: '#/components/schemas/AssignableRole' }
+                shiftStart:
+                  { type: string, pattern: '^([01]\d|2[0-3]):[0-5]\d$', description: Super admin only. }
+                shiftEnd:
+                  { type: string, pattern: '^([01]\d|2[0-3]):[0-5]\d$', description: Super admin only. }
+      responses:
+        '200': { $ref: '#/components/responses/AdminUser' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Admin]
+      operationId: adminDeactivateUser
+      summary: Remove (deactivate) a user
+      description: |
+        Sets status `INACTIVE`; attendance, tasks and reports are kept. Takes effect immediately: existing access
+        tokens stop working, refresh tokens are revoked, push devices are forgotten, and the user drops out of the
+        dashboard and assignee lists. Their old tokens get `401 ACCOUNT_INACTIVE` and login returns
+        `403 ACCOUNT_INACTIVE`. Admins may remove employees; only the super admin may remove admins; nobody can remove
+        the super admin or themselves. Undo with `POST /admin/users/{id}/reactivate` (same permissions).
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { $ref: '#/components/responses/AdminUser' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/users/{id}/approve:
+    post:
+      tags: [Admin]
+      operationId: adminApproveUser
+      summary: Approve a pending sign-up
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                shiftStart:
+                  {
+                    type: string,
+                    pattern: '^([01]\d|2[0-3]):[0-5]\d$',
+                    description: Super admin only. Defaults to the office defaultShiftStart.,
+                  }
+                shiftEnd:
+                  {
+                    type: string,
+                    pattern: '^([01]\d|2[0-3]):[0-5]\d$',
+                    description: Super admin only. Defaults to the office defaultShiftEnd.,
+                  }
+      responses:
+        '200': { $ref: '#/components/responses/AdminUser' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/users/{id}/reject:
+    post:
+      tags: [Admin]
+      operationId: adminRejectUser
+      summary: Reject a pending sign-up
+      description: Deletes the sign-up, so the person may register again. Only `PENDING` users can be rejected.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { $ref: '#/components/responses/Empty' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/users/{id}/reactivate:
+    post:
+      tags: [Admin]
+      operationId: adminReactivateUser
+      summary: Restore a removed user
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { $ref: '#/components/responses/AdminUser' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/office:
+    get:
+      tags: [Admin]
+      operationId: adminGetOffice
+      summary: Office settings (location, geofence, working time)
+      description: Any admin may read them. Only the super admin may change them.
+      responses:
+        '200': { $ref: '#/components/responses/OfficeSettings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    patch:
+      tags: [Admin]
+      operationId: superAdminUpdateOffice
+      summary: Change office location, geofence and working time (SUPER_ADMIN only)
+      description: |
+        Admins and employees get `403 FORBIDDEN`. Send any subset of fields. The new geofence and grace minutes apply
+        from the next clock-in; attendance already recorded is not re-evaluated. `defaultShiftStart` and
+        `defaultShiftEnd` are given to new users; set `applyShiftToAllUsers: true` to give every existing user the
+        office shift as well. The end must be later than the start. A new `timezone`
+        applies at once; apps receive it in the user profile (`timezone`) at their next sign-in or launch.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                name: { type: string, minLength: 1, maxLength: 150, example: LEADS Office Geofence }
+                address: { type: string, minLength: 1, maxLength: 300 }
+                latitude: { type: number, minimum: -90, maximum: 90, example: 1.417 }
+                longitude: { type: number, minimum: -180, maximum: 180, example: 103.868 }
+                radiusMeters: { type: integer, minimum: 10, maximum: 5000, example: 150 }
+                defaultShiftStart: { type: string, pattern: '^([01]\d|2[0-3]):[0-5]\d$', example: '09:00' }
+                defaultShiftEnd: { type: string, pattern: '^([01]\d|2[0-3]):[0-5]\d$', example: '18:00' }
+                lateGraceMinutes: { type: integer, minimum: 0, maximum: 240, example: 10 }
+                timezone:
+                  type: string
+                  maxLength: 64
+                  example: Asia/Kolkata
+                  description: IANA timezone name. Applies at once to "today", lateness and the job schedules.
+                applyShiftToAllUsers:
+                  type: boolean
+                  default: false
+                  description: |
+                    Requires defaultShiftStart or defaultShiftEnd. Sets every user's shiftStart and shiftEnd to the
+                    office defaults (after this update).
+      responses:
+        '200': { $ref: '#/components/responses/OfficeSettings' }
         '400': { $ref: '#/components/responses/ValidationError' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -953,7 +1320,9 @@ paths:
       tags: [Admin]
       operationId: adminCreateLeave
       summary: Record leave for an employee
-      description: Rejects ranges that overlap an existing leave for the same user (`400 VALIDATION_ERROR`).
+      description: |
+        The leave is `APPROVED` at once and the employee gets a push. Ranges overlapping pending or approved leave
+        of the same user are rejected (`400 VALIDATION_ERROR`).
       requestBody:
         required: true
         content:
@@ -967,42 +1336,93 @@ paths:
                 toDate: { $ref: '#/components/schemas/WorkDate' }
                 reason: { type: string, minLength: 1, maxLength: 500 }
       responses:
-        '201':
-          description: Created
-          content:
-            application/json:
-              schema:
-                allOf:
-                  - $ref: '#/components/schemas/SuccessEnvelope'
-                  - properties:
-                      data: { $ref: '#/components/schemas/Leave' }
+        '201': { $ref: '#/components/responses/LeaveCreated' }
         '400': { $ref: '#/components/responses/ValidationError' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
     get:
       tags: [Admin]
       operationId: adminListLeaves
-      summary: Leaves covering a date
+      summary: List leave
+      description: |
+        With `date`: approved leave covering that day. Otherwise leave in `status` (default `APPROVED`):
+        `PENDING` and `APPROVED` list what hasn't ended yet, soonest first; `REJECTED` and `CANCELLED` the latest
+        100.
       parameters:
         - name: date
           in: query
-          description: Defaults to today (Singapore).
           schema: { $ref: '#/components/schemas/WorkDate' }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/LeaveStatus' }
       responses:
-        '200':
-          description: Leaves
-          content:
-            application/json:
-              schema:
-                allOf:
-                  - $ref: '#/components/schemas/SuccessEnvelope'
-                  - properties:
-                      data:
-                        type: array
-                        items: { $ref: '#/components/schemas/Leave' }
+        '200': { $ref: '#/components/responses/LeaveList' }
         '400': { $ref: '#/components/responses/ValidationError' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/leaves/{id}/approve:
+    post:
+      tags: [Admin]
+      operationId: adminApproveLeave
+      summary: Approve a pending leave request
+      description: Only `PENDING` leave. The employee gets a push.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string, maxLength: 500, description: Shown to the employee. }
+      responses:
+        '200': { $ref: '#/components/responses/LeaveOne' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/leaves/{id}/reject:
+    post:
+      tags: [Admin]
+      operationId: adminRejectLeave
+      summary: Reject a pending leave request
+      description: Only `PENDING` leave. The employee gets a push with the note.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string, maxLength: 500, description: Shown to the employee. }
+      responses:
+        '200': { $ref: '#/components/responses/LeaveOne' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/leaves/{id}/cancel:
+    post:
+      tags: [Admin]
+      operationId: adminCancelLeave
+      summary: Cancel pending or approved leave that hasn't ended
+      description: Sets `CANCELLED` (the row is kept). The employee gets a push.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string, maxLength: 500, description: Shown to the employee. }
+      responses:
+        '200': { $ref: '#/components/responses/LeaveOne' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
 components:
   securitySchemes:
@@ -1059,6 +1479,9 @@ components:
                 - LOW_ACCURACY
                 - MOCK_LOCATION
                 - RATE_LIMITED
+                - EMAIL_TAKEN
+                - ACCOUNT_PENDING
+                - ACCOUNT_INACTIVE
                 - INTERNAL_ERROR
                 - SERVICE_UNAVAILABLE
             message: { type: string }
@@ -1075,7 +1498,12 @@ components:
       description: Calendar date in Asia/Singapore.
       example: '2026-10-16'
 
-    Role: { type: string, enum: [EMPLOYEE, ADMIN] }
+    Role: { type: string, enum: [EMPLOYEE, ADMIN, SUPER_ADMIN] }
+    AssignableRole:
+      type: string
+      enum: [EMPLOYEE, ADMIN]
+      description: Roles that can be given through the API. `ADMIN` only by the super admin.
+    UserStatus: { type: string, enum: [PENDING, ACTIVE, INACTIVE] }
     AttendanceStatus: { type: string, enum: [NOT_CLOCKED_IN, CLOCKED_IN, CLOCKED_OUT] }
     AttendanceMethod: { type: string, enum: [GEOFENCE, MANUAL] }
     LiveStatus: { type: string, enum: [IN_OFFICE, LATE, ON_LEAVE, ABSENT, CLOCKED_OUT] }
@@ -1115,16 +1543,67 @@ components:
 
     User:
       type: object
-      required: [id, name, email, role, initials, shiftStart, officeId]
+      required: [id, name, email, role, initials, shiftStart, shiftEnd, officeId, timezone]
       properties:
         id: { type: integer, example: 1 }
         name: { type: string, example: Mark Tan }
         email: { type: string, format: email, example: mark.tan@leads-ndt.com }
         role: { $ref: '#/components/schemas/Role' }
         initials: { type: string, example: MT }
-        shiftStart: { type: string, example: '09:00', description: 'HH:mm, Singapore time' }
+        shiftStart: { type: string, example: '09:00', description: 'HH:mm, company timezone' }
+        shiftEnd:
+          { type: string, example: '18:00', description: 'HH:mm, company timezone; later than shiftStart' }
         officeId: { type: integer, example: 1 }
+        timezone:
+          type: string
+          example: Asia/Singapore
+          description: The company timezone (IANA name, set by the super admin). Apps show every time in it.
 
+    OfficeSettings:
+      type: object
+      required:
+        [
+          id,
+          name,
+          address,
+          latitude,
+          longitude,
+          radiusMeters,
+          defaultShiftStart,
+          defaultShiftEnd,
+          lateGraceMinutes,
+          timezone,
+          updatedUtc,
+        ]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        address: { type: string }
+        latitude: { type: number }
+        longitude: { type: number }
+        radiusMeters: { type: integer }
+        defaultShiftStart: { type: string, example: '09:00' }
+        defaultShiftEnd: { type: string, example: '18:00' }
+        lateGraceMinutes:
+          { type: integer, description: 'Minutes after shiftStart before a clock-in counts as late.' }
+        timezone:
+          type: string
+          example: Asia/Singapore
+          description: Company timezone (IANA name) for work dates, lateness, job schedules and displayed times.
+        updatedUtc: { type: string, format: date-time }
+    AdminUser:
+      type: object
+      required: [id, name, email, role, initials, status, shiftStart, shiftEnd, createdUtc]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        email: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        initials: { type: string }
+        status: { $ref: '#/components/schemas/UserStatus' }
+        shiftStart: { type: string, example: '09:00' }
+        shiftEnd: { type: string, example: '18:00' }
+        createdUtc: { type: string, format: date-time }
     Office:
       type: object
       required: [id, name, address, latitude, longitude, radiusMeters]
@@ -1248,11 +1727,21 @@ components:
     Overview:
       type: object
       required:
-        [totalEmployees, inOffice, inOfficePct, late, onLeave, taskCompletionPct, taskCompletionDeltaPct]
+        [
+          totalEmployees,
+          inOffice,
+          inOfficePct,
+          clockedOut,
+          late,
+          onLeave,
+          taskCompletionPct,
+          taskCompletionDeltaPct,
+        ]
       properties:
         totalEmployees: { type: integer, description: Active EMPLOYEE users. }
-        inOffice: { type: integer, description: Open shifts plus shifts already clocked out today. }
-        inOfficePct: { type: integer }
+        inOffice: { type: integer, description: Employees clocked in now (open shifts). }
+        inOfficePct: { type: integer, description: inOffice ÷ totalEmployees × 100. }
+        clockedOut: { type: integer, description: Employees who clocked in and out today. }
         late:
           type: object
           required: [count, names]
@@ -1261,15 +1750,21 @@ components:
             names: { type: array, items: { type: string } }
         onLeave: { type: integer }
         taskCompletionPct: { type: integer, description: Completed ÷ total tasks due today × 100. }
-        taskCompletionDeltaPct: { type: integer, description: Today's figure minus yesterday's. }
+        taskCompletionDeltaPct:
+          type: [integer, 'null']
+          description: Today's figure minus yesterday's; null when either day has no tasks due.
 
     LiveAttendanceRow:
       type: object
-      required: [user, status, clockInUtc]
+      required: [user, status, clockInUtc, clockOutUtc, isLate]
       properties:
         user: { $ref: '#/components/schemas/UserRef' }
-        status: { $ref: '#/components/schemas/LiveStatus' }
+        status:
+          allOf: [{ $ref: '#/components/schemas/LiveStatus' }]
+          description: CLOCKED_OUT once the shift is closed; LATE or IN_OFFICE while it is open.
         clockInUtc: { type: [string, 'null'], format: date-time }
+        clockOutUtc: { type: [string, 'null'], format: date-time }
+        isLate: { type: boolean, description: Today's clock-in was late (kept after clock-out). }
 
     DailyReport:
       type: object
@@ -1283,25 +1778,86 @@ components:
         submittedUtc: { type: string, format: date-time }
         durationMinutes: { type: [integer, 'null'] }
 
+    LeaveStatus:
+      type: string
+      enum: [PENDING, APPROVED, REJECTED, CANCELLED]
+      description: Only APPROVED leave counts as "on leave".
+
     Leave:
       type: object
-      required: [id, userId, user, fromDate, toDate, reason, createdUtc, createdBy]
+      required:
+        [
+          id,
+          userId,
+          user,
+          fromDate,
+          toDate,
+          days,
+          reason,
+          status,
+          createdUtc,
+          createdBy,
+          reviewedBy,
+          reviewedUtc,
+          reviewNote,
+        ]
       properties:
         id: { type: integer }
         userId: { type: integer }
         user: { $ref: '#/components/schemas/UserRef' }
         fromDate: { $ref: '#/components/schemas/WorkDate' }
         toDate: { $ref: '#/components/schemas/WorkDate' }
+        days: { type: integer, description: Calendar days, both ends included. }
         reason: { type: string }
+        status: { $ref: '#/components/schemas/LeaveStatus' }
         createdUtc: { type: string, format: date-time }
         createdBy:
           type: object
+          description: The admin who recorded it, or the employee who requested it.
           required: [id, name]
           properties:
             id: { type: integer }
             name: { type: string }
+        reviewedBy:
+          type: [object, 'null']
+          description: Who approved, rejected, cancelled or withdrew it.
+          required: [id, name]
+          properties:
+            id: { type: integer }
+            name: { type: string }
+        reviewedUtc: { type: [string, 'null'], format: date-time }
+        reviewNote: { type: [string, 'null'] }
 
   responses:
+    LeaveOne:
+      description: The leave
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data: { $ref: '#/components/schemas/Leave' }
+    LeaveCreated:
+      description: Created
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data: { $ref: '#/components/schemas/Leave' }
+    LeaveList:
+      description: Leave
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Leave' }
     Empty:
       description: Success with an empty object
       content:
@@ -1351,18 +1907,46 @@ components:
               details:
                 fields:
                   - { field: email, message: Invalid email }
+    OfficeSettings:
+      description: The office settings
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data: { $ref: '#/components/schemas/OfficeSettings' }
+    AdminUser:
+      description: The user
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data: { $ref: '#/components/schemas/AdminUser' }
+    EmailTaken:
+      description: '`EMAIL_TAKEN`: an account with this email already exists'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    AccountBlocked:
+      description: '`ACCOUNT_PENDING` (sign-up not yet approved) or `ACCOUNT_INACTIVE` (removed by an admin)'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
     InvalidCredentials:
       description: '`INVALID_CREDENTIALS`'
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }
     Unauthorized:
-      description: '`UNAUTHORIZED` (missing/invalid token) or `TOKEN_EXPIRED`'
+      description: '`UNAUTHORIZED` (missing/invalid token), `TOKEN_EXPIRED`, or `ACCOUNT_INACTIVE` (the account was removed by an admin after the token was issued; end the session and say so)'
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }
     Forbidden:
-      description: '`FORBIDDEN`: wrong role, or not the owner of the resource'
+      description: '`FORBIDDEN`: wrong role (including an admin attempting a super-admin-only action), or not the owner of the resource'
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }

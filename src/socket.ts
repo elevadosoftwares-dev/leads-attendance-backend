@@ -1,9 +1,10 @@
 import type http from 'node:http';
 import { Server } from 'socket.io';
 import { env } from './config/env';
-import { verifyAccessToken } from './modules/auth/token.service';
+import { resolveAccessToken } from './middleware/auth';
+import { isAdminRole } from './modules/auth/auth.types';
 import { getLiveRow, getOverview } from './modules/admin/admin.service';
-import { attachAdminNamespace } from './services/realtime.service';
+import { attachAdminNamespace, userRoom } from './services/realtime.service';
 import { logger } from './utils/logger';
 
 /**
@@ -17,12 +18,12 @@ export function createSocketServer(server: http.Server): Server {
   });
 
   const adminNs = io.of('/admin');
-  adminNs.use((socket, next) => {
+  adminNs.use(async (socket, next) => {
     try {
       const token = socket.handshake.auth?.token;
       if (typeof token !== 'string' || token === '') throw new Error('UNAUTHORIZED');
-      const user = verifyAccessToken(token);
-      if (user.role !== 'ADMIN') return next(new Error('FORBIDDEN'));
+      const user = await resolveAccessToken(token);
+      if (!isAdminRole(user.role)) return next(new Error('FORBIDDEN'));
       socket.data.user = user;
       next();
     } catch (err) {
@@ -31,7 +32,10 @@ export function createSocketServer(server: http.Server): Server {
     }
   });
   adminNs.on('connection', (socket) => {
-    logger.debug({ userId: socket.data.user?.id }, 'Admin dashboard connected');
+    const userId = socket.data.user?.id;
+    logger.debug({ userId }, 'Admin dashboard connected');
+    // A room per user lets the server disconnect an admin who is removed or demoted.
+    if (userId) void socket.join(userRoom(userId));
   });
 
   attachAdminNamespace(adminNs, { liveRow: getLiveRow, overview: getOverview });

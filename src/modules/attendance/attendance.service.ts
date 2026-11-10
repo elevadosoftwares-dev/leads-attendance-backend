@@ -24,6 +24,7 @@ import {
   type OfficeRow,
 } from '../offices/offices.repository';
 import { toTaskSummary, toTaskSummaryWithAssignee } from '../tasks/tasks.mapper';
+import { approvedLeavesInRange } from '../leaves/leaves.service';
 import * as tasksRepo from '../tasks/tasks.repository';
 import type { TaskSummary } from '../tasks/tasks.types';
 import { findUserById } from '../users/users.repository';
@@ -141,7 +142,7 @@ export async function clockIn(userId: number, input: ClockInInput): Promise<Atte
     throw alreadyClockedIn('You have already completed a shift today');
   }
 
-  const isLate = computeIsLate(now, workDate, fromTimeColumn(user.ShiftStart));
+  const isLate = computeIsLate(now, workDate, fromTimeColumn(user.ShiftStart), office.LateGraceMinutes);
   let attendanceId: number;
   try {
     attendanceId = await repo.insertGeofenceClockIn(userId, workDate, now, isLate, {
@@ -261,9 +262,10 @@ export async function clockOut(
 
 export async function getHistory(userId: number, month: string = currentMonth()) {
   const { from, to } = monthRange(month);
-  const [rows, taskCounts] = await Promise.all([
+  const [rows, taskCounts, leaves] = await Promise.all([
     repo.listHistory(userId, from, to),
     tasksRepo.taskCountsInRange(userId, from, to),
+    approvedLeavesInRange(userId, from, to),
   ]);
   const closed = rows.filter((r) => r.DurationMinutes !== null);
   const avgMinutes =
@@ -284,5 +286,6 @@ export async function getHistory(userId: number, month: string = currentMonth())
       tasksCompleted: r.TasksCompleted,
       tasksTotal: r.TasksTotal,
     })),
+    leaves: leaves.map((l) => ({ id: l.id, fromDate: l.fromDate, toDate: l.toDate, reason: l.reason })),
   };
 }

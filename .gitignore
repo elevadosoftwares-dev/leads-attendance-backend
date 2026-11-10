@@ -9,3 +9,4 @@ uploads/*
 secrets/
 *.log
 uploads-test
+iisnode/

@@ -264,13 +264,27 @@ describe('admin tasks', () => {
     expect(mine.body.data.total).toBe(1);
   });
 
-  it('notifies the assignee only when notify=true', async () => {
+  it('always notifies the assignee of a new task', async () => {
     const spy = vi.spyOn(pushService, 'notifyUsers').mockResolvedValue();
-    await create({ notify: false });
-    expect(spy).not.toHaveBeenCalled();
-    const res = await create({ notify: true });
+    // Even when an older client sends notify=false.
+    const res = await create({ notify: false });
+    expect(spy).toHaveBeenCalledTimes(1);
     expect(spy).toHaveBeenCalledWith([mark.id], expect.objectContaining({ title: 'New task assigned' }));
     expect(spy.mock.calls[0]![1].data).toEqual({ type: 'TASK', taskId: String(res.body.data.id) });
+  });
+
+  it('notifies a new assignee on reassignment, other edits only with notify=true', async () => {
+    const { body } = await create({});
+    const spy = vi.spyOn(pushService, 'notifyUsers').mockResolvedValue();
+    const patch = (b: object) =>
+      request(app).patch(`/api/v1/admin/tasks/${body.data.id}`).set(auth(admin)).send(b);
+
+    await patch({ title: 'Renamed' });
+    expect(spy).not.toHaveBeenCalled();
+    await patch({ title: 'Renamed again', notify: true });
+    expect(spy).toHaveBeenLastCalledWith([mark.id], expect.objectContaining({ title: 'Task updated' }));
+    await patch({ assigneeId: john.id });
+    expect(spy).toHaveBeenLastCalledWith([john.id], expect.objectContaining({ title: 'New task assigned' }));
   });
 
   it('validates input and the assignee', async () => {

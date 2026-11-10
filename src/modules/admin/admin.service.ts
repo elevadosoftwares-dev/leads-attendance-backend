@@ -1,16 +1,16 @@
-import { fromDateColumn, fromTimeColumn, isUniqueViolation, withTransaction } from '../../db/pool';
+import { fromTimeColumn, isUniqueViolation, withTransaction } from '../../db/pool';
 import { realtime } from '../../services/realtime.service';
 import { AppError } from '../../utils/AppError';
-import { initialsOf, percent } from '../../utils/format';
+import { percent } from '../../utils/format';
 import { addDaysToWorkDate, computeIsLate, isoUtc, toWorkDate, todayWorkDate } from '../../utils/time';
-import type { Role } from '../auth/auth.types';
 import { toAttendanceDto, type AttendanceDto } from '../attendance/attendance.mapper';
 import * as attendanceRepo from '../attendance/attendance.repository';
 import { taskCountsOnDate } from '../tasks/tasks.repository';
 import { userRef, type UserRef } from '../users/users.mapper';
-import { findUserById, listActiveUsers } from '../users/users.repository';
+import { findOfficeForUser } from '../offices/offices.repository';
+import { findUserById } from '../users/users.repository';
 import * as repo from './admin.repository';
-import type { CreateLeaveInput, ManualAttendanceInput } from './admin.schemas';
+import type { ManualAttendanceInput } from './admin.schemas';
 
 export type LiveStatus = 'IN_OFFICE' | 'LATE' | 'ON_LEAVE' | 'ABSENT' | 'CLOCKED_OUT';
 
@@ -18,23 +18,27 @@ export interface LiveAttendanceRow {
   user: UserRef;
   status: LiveStatus;
   clockInUtc: string | null;
+  clockOutUtc: string | null;
+  isLate: boolean;
 }
 
 export interface Overview {
   totalEmployees: number;
   inOffice: number;
   inOfficePct: number;
+  clockedOut: number;
   late: { count: number; names: string[] };
   onLeave: number;
   taskCompletionPct: number;
-  taskCompletionDeltaPct: number;
+  /** Null when today or yesterday has no tasks due, so there is nothing to compare. */
+  taskCompletionDeltaPct: number | null;
 }
 
-/** LATE if clocked in late; IN_OFFICE if on time and still open; then CLOCKED_OUT, ON_LEAVE, ABSENT. */
+/** CLOCKED_OUT once the shift is closed; LATE or IN_OFFICE while it is open; then ON_LEAVE, ABSENT. */
 export function liveStatusOf(row: repo.LiveRow): LiveStatus {
   if (row.ClockInUtc) {
-    if (row.IsLate) return 'LATE';
-    return row.ClockOutUtc ? 'CLOCKED_OUT' : 'IN_OFFICE';
+    if (row.ClockOutUtc) return 'CLOCKED_OUT';
+    return row.IsLate ? 'LATE' : 'IN_OFFICE';
   }
   return row.OnLeave ? 'ON_LEAVE' : 'ABSENT';
 }
@@ -44,6 +48,8 @@ function toLiveRow(row: repo.LiveRow): LiveAttendanceRow {
     user: userRef(row.UserId, row.Name),
     status: liveStatusOf(row),
     clockInUtc: isoUtc(row.ClockInUtc),
+    clockOutUtc: isoUtc(row.ClockOutUtc),
+    isLate: row.IsLate === true,
   };
 }
 
@@ -64,24 +70,24 @@ export async function getOverview(): Promise<Overview> {
     taskCountsOnDate(today),
     taskCountsOnDate(addDaysToWorkDate(today, -1)),
   ]);
-  // inOffice = open shifts plus shifts already clocked out today.
-  const inOffice = rows.filter((r) => r.ClockInUtc !== null).length;
+  // inOffice = open shifts only; shifts already closed today are counted in clockedOut.
+  const inOffice = rows.filter((r) => r.ClockInUtc !== null && r.ClockOutUtc === null).length;
+  const clockedOut = rows.filter((r) => r.ClockInUtc !== null && r.ClockOutUtc !== null).length;
   const late = rows.filter((r) => r.IsLate);
   const taskCompletionPct = percent(todayTasks.completed, todayTasks.total);
   return {
     totalEmployees: rows.length,
     inOffice,
     inOfficePct: percent(inOffice, rows.length),
+    clockedOut,
     late: { count: late.length, names: late.map((r) => r.Name) },
     onLeave: rows.filter((r) => r.OnLeave).length,
     taskCompletionPct,
-    taskCompletionDeltaPct: taskCompletionPct - percent(yesterdayTasks.completed, yesterdayTasks.total),
+    taskCompletionDeltaPct:
+      todayTasks.total === 0 || yesterdayTasks.total === 0
+        ? null
+        : taskCompletionPct - percent(yesterdayTasks.completed, yesterdayTasks.total),
   };
-}
-
-export async function listUsers(role?: Role) {
-  const users = await listActiveUsers(role);
-  return users.map((u) => ({ id: u.UserId, name: u.Name, initials: initialsOf(u.Name), role: u.Role }));
 }
 
 async function requireEmployee(userId: number) {
@@ -101,6 +107,8 @@ export async function addManualAttendance(
   input: ManualAttendanceInput,
 ): Promise<AttendanceDto> {
   const user = await requireEmployee(input.userId);
+  const office = await findOfficeForUser(input.userId);
+  if (!office) throw AppError.notFound('No office is assigned to this user');
   const clockIn = toSeconds(input.clockInUtc);
   const clockOut = input.clockOutUtc ? toSeconds(input.clockOutUtc) : null;
 
@@ -134,7 +142,12 @@ export async function addManualAttendance(
           workDate: input.workDate,
           clockInUtc: clockIn,
           clockOutUtc: clockOut,
-          isLate: computeIsLate(clockIn, input.workDate, fromTimeColumn(user.ShiftStart)),
+          isLate: computeIsLate(
+            clockIn,
+            input.workDate,
+            fromTimeColumn(user.ShiftStart),
+            office.LateGraceMinutes,
+          ),
           reason: input.reason,
           createdBy: adminId,
         },
@@ -162,47 +175,4 @@ export async function listReports(date: string = todayWorkDate()) {
     submittedUtc: isoUtc(r.SubmittedUtc),
     durationMinutes: r.DurationMinutes,
   }));
-}
-
-export interface LeaveDto {
-  id: number;
-  userId: number;
-  user: UserRef;
-  fromDate: string;
-  toDate: string;
-  reason: string;
-  createdUtc: string;
-  createdBy: { id: number; name: string };
-}
-
-function toLeaveDto(row: repo.LeaveRow): LeaveDto {
-  return {
-    id: row.LeaveId,
-    userId: row.UserId,
-    user: userRef(row.UserId, row.UserName),
-    fromDate: fromDateColumn(row.FromDate),
-    toDate: fromDateColumn(row.ToDate),
-    reason: row.Reason,
-    createdUtc: isoUtc(row.CreatedUtc),
-    createdBy: { id: row.CreatedBy, name: row.CreatedByName },
-  };
-}
-
-export async function createLeave(adminId: number, input: CreateLeaveInput): Promise<LeaveDto> {
-  await requireEmployee(input.userId);
-  const leaveId = await withTransaction(async (tx) => {
-    if (await repo.hasOverlappingLeave(input.userId, input.fromDate, input.toDate, tx)) {
-      throw AppError.validation('This leave overlaps an existing leave for the user', {
-        fields: [{ field: 'fromDate', message: 'overlaps an existing leave' }],
-      });
-    }
-    return repo.insertLeave({ ...input, createdBy: adminId }, tx);
-  });
-  const today = todayWorkDate();
-  if (input.fromDate <= today && today <= input.toDate) realtime.attendanceChanged(input.userId);
-  return toLeaveDto((await repo.findLeave(leaveId))!);
-}
-
-export async function listLeaves(date: string = todayWorkDate()): Promise<LeaveDto[]> {
-  return (await repo.listLeavesCovering(date)).map(toLeaveDto);
 }

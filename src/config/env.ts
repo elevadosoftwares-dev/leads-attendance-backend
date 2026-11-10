@@ -54,7 +54,6 @@ const envSchema = z.object({
   JWT_REFRESH_TTL: duration.default('30d'),
 
   APP_TIMEZONE: z.string().default('Asia/Singapore'),
-  LATE_GRACE_MINUTES: z.coerce.number().int().min(0).default(10),
   MAX_GPS_ACCURACY_METERS: z.coerce.number().positive().default(50),
   CLOCK_OUT_REQUIRES_GEOFENCE: bool(false),
 

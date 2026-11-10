@@ -79,9 +79,10 @@ export async function createUser(
     .input('shiftStart', sql.NVarChar, opts.shiftStart ?? '09:00')
     .input('isActive', sql.Bit, opts.isActive ?? true)
     .query<{ id: number }>(
-      `INSERT INTO dbo.Users (Name, Email, PasswordHash, Role, OfficeId, ShiftStart, IsActive)
+      `INSERT INTO dbo.Users (Name, Email, PasswordHash, Role, OfficeId, ShiftStart, IsActive, Status)
        OUTPUT INSERTED.UserId AS id
-       VALUES (@name, @email, @hash, @role, @officeId, CAST(@shiftStart AS TIME(0)), @isActive)`,
+       VALUES (@name, @email, @hash, @role, @officeId, CAST(@shiftStart AS TIME(0)), @isActive,
+               CASE WHEN @isActive = 1 THEN N'ACTIVE' ELSE N'INACTIVE' END)`,
     );
   const id = result.recordset[0]!.id;
   return { id, name, email, role, token: signAccessToken({ id, role }) };

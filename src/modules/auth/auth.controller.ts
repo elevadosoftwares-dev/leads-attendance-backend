@@ -7,6 +7,10 @@ export async function login(req: Request, res: Response) {
   ok(res, await authService.login(req.body.email, req.body.password));
 }
 
+export async function signup(req: Request, res: Response) {
+  ok(res, await authService.signup(req.body.name, req.body.email, req.body.password), 201);
+}
+
 export async function refresh(req: Request, res: Response) {
   ok(res, await authService.refresh(req.body.refreshToken));
 }

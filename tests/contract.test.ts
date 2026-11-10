@@ -26,7 +26,7 @@ afterAll(async () => {
 
 describe('OpenAPI contract', () => {
   it('documents every endpoint in the contract', () => {
-    expect(operations).toHaveLength(35);
+    expect(operations).toHaveLength(51);
   });
 
   it.each(operations)('$method $route is implemented', async ({ method, route, isPublic }) => {

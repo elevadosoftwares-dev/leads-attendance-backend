@@ -41,7 +41,9 @@ describe('POST /auth/login', () => {
         role: 'EMPLOYEE',
         initials: 'MT',
         shiftStart: '09:00',
+        shiftEnd: '18:00',
         officeId,
+        timezone: 'Asia/Singapore',
       },
     });
     const payload = jwt.decode(res.body.data.accessToken) as Record<string, unknown>;
@@ -64,11 +66,15 @@ describe('POST /auth/login', () => {
     expect(wrong.body.error.code).toBe('INVALID_CREDENTIALS');
   });
 
-  it('rejects inactive users', async () => {
+  it('tells a deactivated user with the right password that the account is inactive', async () => {
     const inactive = await createUser(officeId, { email: 'gone@leads-ndt.com', isActive: false });
     const res = await login(inactive.email, PASSWORD);
-    expect(res.status).toBe(401);
-    expect(res.body.error.code).toBe('INVALID_CREDENTIALS');
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('ACCOUNT_INACTIVE');
+    // A wrong password reveals nothing about the account state.
+    const wrong = await login(inactive.email, 'Wrong-pass-1');
+    expect(wrong.status).toBe(401);
+    expect(wrong.body.error.code).toBe('INVALID_CREDENTIALS');
   });
 
   it('validates the body', async () => {

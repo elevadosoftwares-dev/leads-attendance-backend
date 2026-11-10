@@ -19,7 +19,7 @@ no ORM) · zod · JWT · Socket.IO · firebase-admin (FCM) · node-cron · vites
 npm install
 cp .env.example .env        # then fill in DB_* and the two JWT secrets
 npm run migrate             # creates the database if needed and applies db/migrations/*.sql
-npm run seed                # wipes and loads demo data (refuses in production)
+npm run seed                # wipes everything, creates the office + super admin (refuses in production)
 npm run dev                 # http://localhost:4000/api/v1  (watch mode)
 ```
 
@@ -46,11 +46,12 @@ For a named instance (e.g. `SQLEXPRESS`), set `DB_INSTANCE` instead of relying o
 | `npm start` | Run the compiled server (`dist/src/server.js`) |
 | `npm run migrate` | Apply pending migrations (from source) |
 | `npm run migrate:prod` | Apply pending migrations (from `dist/`, no dev dependencies needed) |
-| `npm run seed` | Reset all data to the demo dataset |
+| `npm run seed` | **Delete all data** and create only the office and the super admin |
+| `npm run user:create -- --name "Jane Lim" --email jane@leads-ndt.com --role ADMIN` | Create an active user (use it to make the first real admin). Optional `--shift 09:00`, `--password …`; without a password a temporary one is printed once. `user:create:prod` runs the compiled version |
 | `npm test` | Integration and unit tests against a real SQL Server test database |
 | `npm run lint` | ESLint and Prettier check |
 | `npm run format` | Prettier write |
-| `node scripts/build-postman.mjs` | Regenerate the Postman collection |
+| `npm run docs:postman` | Regenerate the Postman documentation (runs every endpoint against the test database) |
 
 ## Environment variables
 
@@ -68,78 +69,40 @@ invalid. See [`.env.example`](.env.example) for the full annotated list.
 | `TEST_DB_NAME` | `${DB_NAME}_test` | **Dropped and recreated** by `npm test`; must end with `_test` |
 | `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET` | | At least 32 characters each |
 | `JWT_ACCESS_TTL` / `JWT_REFRESH_TTL` | `15m` / `30d` | |
-| `APP_TIMEZONE` | `Asia/Singapore` | Defines "today" and every work date |
-| `LATE_GRACE_MINUTES` | `10` | |
+| `APP_TIMEZONE` | `Asia/Singapore` | Fallback company timezone; the super admin sets the real one in office settings |
 | `MAX_GPS_ACCURACY_METERS` | `50` | |
 | `CLOCK_OUT_REQUIRES_GEOFENCE` | `false` | |
 | `UPLOAD_DIR` / `MAX_UPLOAD_MB` | `./uploads` / `10` | |
 | `FIREBASE_SERVICE_ACCOUNT_PATH` | – | Path to a service-account JSON. When unset, push is a logged no-op |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM` | – | When `SMTP_HOST` is unset, reset links are logged to the console |
+| `SUPERADMIN_NAME`, `SUPERADMIN_EMAIL`, `SUPERADMIN_PASSWORD` | `Super Admin`, `superadmin@leads-ndt.com`, – | Used only by `npm run seed`. Empty password: one is generated and printed |
 | `PASSWORD_RESET_URL` | `${PUBLIC_BASE_URL}/reset-password` | Base of the link in reset emails (`?token=` is appended); point it at the app's deep link |
 | `ENABLE_CRON` | `true` | Run the background jobs in this process (disable on all but one instance) |
 | `LOG_LEVEL` | `info` | |
 
-## Seeded logins
+## Seed: the super admin
 
-All seeded accounts use the password **`Leads@123`**.
+`npm run seed` resets the database to a clean install. It **deletes every row and every uploaded file**, then
+creates exactly two things:
 
-| Role | Name | Email |
-|---|---|---|
-| ADMIN | Admin | `admin@leads-ndt.com` |
-| EMPLOYEE | Mark Tan | `mark.tan@leads-ndt.com` |
-| EMPLOYEE | John Lim | `john.lim@leads-ndt.com` |
-| EMPLOYEE | Sarah Lee | `sarah.lee@leads-ndt.com` |
+- **The office** "LEADS Office Geofence", 123 Aerospace Tech Park, at 1.4170, 103.8680, radius 150 m, default shift
+  start 09:00, 10 minutes late grace. The super admin changes these afterwards with `PATCH /admin/office`.
+- **The super admin**, from `SUPERADMIN_NAME`, `SUPERADMIN_EMAIL` and `SUPERADMIN_PASSWORD` in `.env`. If
+  `SUPERADMIN_PASSWORD` is empty, a random password is generated and printed once.
 
-<details>
-<summary>All 28 employees</summary>
+There is no demo data. Everyone else is added through the API: the super admin creates admins, admins create or
+approve employees, and employees can sign up from the app.
 
-| Name | Email |
+## Roles
+
+| Role | Can do |
 |---|---|
-| Mark Tan | `mark.tan@leads-ndt.com` |
-| John Lim | `john.lim@leads-ndt.com` |
-| Sarah Lee | `sarah.lee@leads-ndt.com` |
-| David Ng | `david.ng@leads-ndt.com` |
-| Michelle Wong | `michelle.wong@leads-ndt.com` |
-| Kevin Chua | `kevin.chua@leads-ndt.com` |
-| Priya Nair | `priya.nair@leads-ndt.com` |
-| Ahmad Rahman | `ahmad.rahman@leads-ndt.com` |
-| Rachel Goh | `rachel.goh@leads-ndt.com` |
-| Daniel Koh | `daniel.koh@leads-ndt.com` |
-| Siti Aminah | `siti.aminah@leads-ndt.com` |
-| Benjamin Ong | `benjamin.ong@leads-ndt.com` |
-| Grace Teo | `grace.teo@leads-ndt.com` |
-| Raj Kumar | `raj.kumar@leads-ndt.com` |
-| Jasmine Lau | `jasmine.lau@leads-ndt.com` |
-| Marcus Yeo | `marcus.yeo@leads-ndt.com` |
-| Nurul Huda | `nurul.huda@leads-ndt.com` |
-| Ethan Ho | `ethan.ho@leads-ndt.com` |
-| Chloe Low | `chloe.low@leads-ndt.com` |
-| Samuel Sim | `samuel.sim@leads-ndt.com` |
-| Aisha Begum | `aisha.begum@leads-ndt.com` |
-| Jonathan Phua | `jonathan.phua@leads-ndt.com` |
-| Vincent Seah | `vincent.seah@leads-ndt.com` |
-| Cheryl Foo | `cheryl.foo@leads-ndt.com` |
-| Arjun Pillai | `arjun.pillai@leads-ndt.com` |
-| Farhan Ismail | `farhan.ismail@leads-ndt.com` |
-| Lucas Quek | `lucas.quek@leads-ndt.com` |
-| Melissa Chan | `melissa.chan@leads-ndt.com` |
+| `EMPLOYEE` | Clock in and out, own tasks, attachments, announcements, own history |
+| `ADMIN` | Everything under `/admin` for employees: dashboard, tasks, announcements, manual attendance, reports, leave (record, approve, reject, cancel), employee accounts (create, approve or reject sign-ups, rename, remove, reactivate). Can **read** the office settings |
+| `SUPER_ADMIN` | Everything an admin can do, plus: **change the office settings** (name, address, location, geofence radius, default shift start and end, late grace minutes, timezone), **set anyone's shift start and end**, and **create, promote, demote or remove admins** |
 
-</details>
-
-**What the seed sets up** (relative to the day you run it, Singapore time):
-
-- Office "LEADS Office Geofence", 123 Aerospace Tech Park, at 1.4170, 103.8680 with a 150 m radius. To clock in
-  from an emulator, set its location to those coordinates.
-- Two weeks of weekday attendance history, with a few late arrivals, a daily report for every shift, and tasks
-  that are mostly completed.
-- **Today:** Mark Tan is *not* clocked in, so the clock-in flow can be demoed immediately. He has five tasks due
-  today (TODO, IN_PROGRESS, COMPLETED, CARRIED_OVER) and one due the next work day. John Lim is in the office on
-  time and Sarah Lee arrived late. Of the rest, most are in the office, a few are late, some have clocked out,
-  two are on leave and a few are absent, so every dashboard state appears.
-- Announcements: "Safety Briefing Tomorrow" (SAFETY, pinned), "New Equipment Calibration" (GENERAL), "LEADS
-  Family Day 2026" (EVENTS), and two older ones.
-
-Re-run `npm run seed` any time to reset the demo data.
+There is one super admin, created by the seed. Nobody can create, change or remove it through the API, except
+renaming itself. When an admin tries a super-admin-only action, the API answers `403 FORBIDDEN`.
 
 ## API overview
 
@@ -150,14 +113,32 @@ app.
 
 | Area | Endpoints |
 |---|---|
-| Auth | `POST /auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/forgot-password`, `/auth/reset-password` |
-| Me | `GET /me`, `POST /me/device-token`, `GET /me/today` |
+| Auth | `POST /auth/signup`, `POST /auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/forgot-password`, `/auth/reset-password` |
+| Me | `GET /me`, `POST /me/device-token`, `GET /me/today`, `POST /me/change-password`, `GET/POST /me/leaves`, `POST /me/leaves/:id/withdraw` |
 | Attendance | `POST /attendance/clock-in`, `GET /attendance/current`, `POST /attendance/clock-out`, `GET /attendance/history?month=` |
 | Tasks | `GET /tasks?date=`, `GET /tasks/:id`, `PATCH /tasks/:id/status`, `POST /tasks/:id/attachments`, `GET /files/:attachmentId` |
 | Announcements | `GET /announcements`, `GET /announcements/:id` |
-| Admin | `/admin/tasks` (CRUD + `/stats`), `/admin/announcements` (CRUD), `GET /admin/overview`, `GET /admin/attendance/live`, `GET /admin/users`, `POST /admin/attendance/manual`, `GET /admin/reports`, `POST/GET /admin/leaves` |
-| Real-time | Socket.IO namespace `/admin` (`auth: { token }`, ADMIN only): `attendance:updated`, `overview:updated`, `task:updated` |
+| Admin | `/admin/tasks` (CRUD + `/stats`), `/admin/announcements` (CRUD), `GET /admin/overview`, `GET /admin/attendance/live`, `/admin/users` (list by status, create, `PATCH`, `DELETE` = remove, `/:id/approve`, `/:id/reject`, `/:id/reactivate`), `GET /admin/office` (any admin), `PATCH /admin/office` (super admin only), `POST /admin/attendance/manual`, `GET /admin/reports`, `POST/GET /admin/leaves` (`?status=` or `?date=`), `POST /admin/leaves/:id/approve` / `reject` / `cancel` |
+| Real-time | Socket.IO namespace `/admin` (`auth: { token }`, ADMIN only): `attendance:updated`, `overview:updated`, `task:updated`, `user:pending`, `leave:updated` |
 | Ops | `GET /health` (checks DB connectivity; 503 when the DB is down) |
+
+### Accounts: sign-up, approval and removal
+
+- **Status:** every user is `PENDING`, `ACTIVE` or `INACTIVE`.
+- **Employees sign up themselves** with `POST /auth/signup`. The account is `PENDING` and login returns
+  `403 ACCOUNT_PENDING` until an admin approves it (`POST /admin/users/:id/approve`, optionally with `shiftStart`).
+  Admins get a `USER_PENDING` push and a `user:pending` socket event. Rejecting deletes the sign-up.
+- **Admins are never self-registered.** Only the super admin creates them (`POST /admin/users` with `role: ADMIN`, or
+  promotes an employee with `PATCH`). `npm run user:create` can also create one from the server.
+- **Removing** (`DELETE /admin/users/:id`) deactivates rather than deletes, so attendance, tasks and reports are kept.
+  It takes effect immediately: existing access tokens stop working, refresh tokens are revoked, push devices are
+  forgotten, and login returns `403 ACCOUNT_INACTIVE`. Requests with a token issued before the removal, and refreshes, answer `401 ACCOUNT_INACTIVE`, so
+  clients can end the session and say why. `POST /admin/users/:id/reactivate` restores the account.
+- **Guards:** admins manage employees only; only the super admin manages admins; nobody can remove themselves or
+  change their own role; the super admin account cannot be changed by anyone else.
+- **Shift times:** new users get the office `defaultShiftStart` and `defaultShiftEnd`. Only the super admin can give
+  someone different ones; the end must be later than the start (shifts don't cross midnight). Lateness uses the start.
+- **Role changes** apply at once, because every request re-reads the account's role and status from the database.
 
 ### Behaviour worth knowing on the client side
 
@@ -175,10 +156,14 @@ These are decisions the contract left open. They are documented in `openapi.yaml
 - **Attachments:** pdf, jpg/jpeg, png, docx and xlsx only, up to 10 MB. The extension, MIME type and file signature
   must agree. Download through the attachment's `url` with the bearer token. Files are never served statically.
 - **Reset-password** with a bad or expired token returns `400 VALIDATION_ERROR` (field `token`).
-- **Overlapping leave** for the same employee returns `400 VALIDATION_ERROR`.
+- **Leave:** an admin records leave as `APPROVED`; an employee requests it from today on as `PENDING`, and an admin
+  approves or rejects it. Only approved leave counts as on leave (dashboard, live status, shift reminder, history).
+  Admins can cancel leave that hasn't ended; employees can withdraw pending leave, or approved leave before it starts.
+  Leave overlapping pending or approved leave of the same employee returns `400 VALIDATION_ERROR`.
   **Overlapping manual attendance** returns `409 ALREADY_CLOCKED_IN`.
 - **Logout then refresh:** presenting a revoked refresh token is treated as token reuse, so all of that user's
   refresh tokens are revoked.
+- **Sign-up rate limit:** 5 per 15 minutes per IP + email, and 20 per hour per IP.
 - **Login rate limit:** 5 attempts per 15 minutes per IP + email. Repeated test runs with the same account will hit
   it. Restart the server to clear it in development, since limits are kept in memory.
 
@@ -197,8 +182,8 @@ src/
   jobs/                shift reminder (08:45 Mon–Fri), auto clock-out (23:59 daily), both in SG time
   utils/               geo (haversine), time (SG helpers), AppError, apiResponse, logger
 db/migrations/         001_init.sql …   (applied files are recorded in dbo.SchemaMigrations)
-db/seed.ts             demo data
-scripts/               migrate.ts, build-postman.mjs
+db/seed.ts             clean install: office + super admin
+scripts/               migrate.ts, create-user.ts, build-postman.ts, deploy.sh
 tests/                 integration tests per module + unit tests
 ```
 
@@ -222,23 +207,29 @@ events, push token cleanup, both cron jobs, and the OpenAPI contract.
 
 ### Postman
 
-```bash
-npm run seed && npm run dev
-postman collection run docs/postman/LEADS-Attendance.postman_collection.json --working-dir .
-```
+[`docs/postman/LEADS-Attendance.postman_collection.json`](docs/postman/LEADS-Attendance.postman_collection.json)
+documents every endpoint. Import it into Postman and open **View documentation**.
 
-The collection logs in as Mark Tan and the admin and walks through the full employee day (geofence rejections,
-clock-in, tasks, upload and download, clock-out with carry-over, history), then announcements, every admin
-endpoint, and sign-out. Each request captures the ids the next one needs. You can also import it into the
-Postman app.
+- **What each request shows:** who can call it, its path and query parameters, a table of every body field with
+  its rules, and every possible response.
+- **Saved examples:** these are real responses, including error cases such as an admin trying a
+  super-admin-only action. Tokens are replaced with placeholders.
+- **Generating it:** `npm run docs:postman` rebuilds the collection. It runs every request against a fresh
+  copy of the **test** database, so your real data is never touched. It fails if any operation in
+  `openapi.yaml` is missing.
+- **Using it:** set `baseUrl`, fill in the email and password variables, and run a Login request. Login stores
+  the token that the other requests use.
 
 ## Security notes
 
 - Access tokens carry only `{ sub, role }` (HS256, 15 min). Refresh tokens are 64 random bytes stored only as
   SHA-256 HMAC hashes, keyed with `JWT_REFRESH_SECRET`. They rotate on every refresh, and reusing a rotated or
   revoked token revokes every session for that user. A password reset also signs out all devices.
-- Login compares passwords in constant time, using a dummy bcrypt hash for unknown emails. Unknown emails,
-  wrong passwords and inactive accounts all return the same `INVALID_CREDENTIALS`. Passwords use bcrypt cost 12.
+- Login compares passwords in constant time, using a dummy bcrypt hash for unknown emails. Unknown emails and
+  wrong passwords return the same `INVALID_CREDENTIALS`; only with the correct password does a pending or removed
+  account answer `403 ACCOUNT_PENDING` / `ACCOUNT_INACTIVE`. Passwords use bcrypt cost 12.
+- Every authenticated request (and every `/admin` socket handshake) re-checks the account in the database, so a
+  removed or demoted user loses access at once instead of when their token expires.
 - `requireRole('ADMIN')` guards the entire `/admin` router. Every body, query and param is validated with zod.
   Every query is parameterized.
 - The app uses helmet, a CORS allow-list and a 1 MB JSON limit. The central error handler never returns stack
@@ -253,6 +244,13 @@ sessions plus a Socket.IO adapter (e.g. Redis); a single instance needs neither.
 
 Put `UPLOAD_DIR` on persistent storage. To move files to Azure Blob Storage, implement `StorageService` in
 `src/services/storage.service.ts` (the database stores only opaque keys) and swap the exported `storage`.
+
+### Linux server with PM2
+
+[`docs/deploy/linux-pm2.md`](docs/deploy/linux-pm2.md) covers a full Ubuntu setup: SQL Server, Node 20,
+PM2 with [`ecosystem.config.cjs`](ecosystem.config.cjs) (one instance, so the cron jobs and Socket.IO stay
+correct), nginx with HTTPS from [`docs/deploy/nginx.conf`](docs/deploy/nginx.conf), and updates with
+[`scripts/deploy.sh`](scripts/deploy.sh).
 
 ### Linux container
 
@@ -288,5 +286,6 @@ recycles processes, so set `ENABLE_CRON=false` there and run the jobs from a sep
 ## Notes
 
 - All timestamps are stored in UTC (`DATETIME2(0)`, whole seconds). "Today", work dates, lateness, due times and
-  cron schedules always use `APP_TIMEZONE`, never the server's local time.
+  cron schedules always use the company timezone (the office's `timezone`, set by the super admin; `APP_TIMEZONE`
+  until the office is read), never the server's local time. The app shows times in the `timezone` from the profile.
 - Durations come from `DATEDIFF(MINUTE, ClockInUtc, ClockOutUtc)` on the server.

@@ -9,6 +9,11 @@ export async function getProfile(userId: number): Promise<UserDto> {
   return toUserDto(user);
 }
 
-export async function registerDeviceToken(userId: number, fcmToken: string, platform: string): Promise<void> {
-  await meRepo.upsertDeviceToken(userId, fcmToken, platform);
+export async function registerDeviceToken(
+  userId: number,
+  fcmToken: string,
+  platform: string,
+  silent: boolean,
+): Promise<void> {
+  await meRepo.upsertDeviceToken(userId, fcmToken, platform, silent);
 }

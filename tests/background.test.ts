@@ -41,8 +41,11 @@ afterAll(async () => {
   await closePool();
 });
 
-const registerDevice = (user: TestUser, fcmToken: string) =>
-  request(app).post('/api/v1/me/device-token').set(auth(user)).send({ fcmToken, platform: 'android' });
+const registerDevice = (user: TestUser, fcmToken: string, silent?: boolean) =>
+  request(app)
+    .post('/api/v1/me/device-token')
+    .set(auth(user))
+    .send({ fcmToken, platform: 'android', silent });
 
 function fakeMessaging(deadTokens: string[] = []) {
   const sendEachForMulticast = vi.fn(async (message: MulticastMessage): Promise<BatchResponse> => {
@@ -86,6 +89,33 @@ describe('push service', () => {
         "SELECT COUNT(*) FROM dbo.DeviceTokens WHERE FcmToken = N'mark-device-token-dead'",
       ),
     ).toBe(0);
+  });
+
+  it('sends to silent devices on the silent channel without sound', async () => {
+    await registerDevice(mark, 'mark-device-token-0001');
+    await registerDevice(mark, 'mark-device-token-mute', true);
+    const send = fakeMessaging();
+
+    await pushService.notifyUsers([mark.id], { title: 'New task assigned', body: 'Inspect hub' });
+
+    expect(send).toHaveBeenCalledTimes(2);
+    const [sound, silent] = send.mock.calls.map((c) => c[0]);
+    expect(sound!.tokens).toEqual(['mark-device-token-0001']);
+    expect(sound!.android?.notification).toMatchObject({ channelId: 'leads_default', defaultSound: true });
+    expect(sound!.apns?.payload?.aps).toEqual({ sound: 'default' });
+    expect(silent!.tokens).toEqual(['mark-device-token-mute']);
+    expect(silent!.android?.notification).toMatchObject({ channelId: 'leads_silent', defaultSound: false });
+    expect(silent!.apns?.payload?.aps).toEqual({});
+
+    // Switching the setting off again re-registers the same token with sound.
+    await registerDevice(mark, 'mark-device-token-mute', false);
+    send.mockClear();
+    await pushService.notifyUsers([mark.id], { title: 'Hi', body: 'There' });
+    expect(send).toHaveBeenCalledOnce();
+    expect([...send.mock.calls[0]![0].tokens].sort()).toEqual([
+      'mark-device-token-0001',
+      'mark-device-token-mute',
+    ]);
   });
 
   it('broadcasts to all active users', async () => {

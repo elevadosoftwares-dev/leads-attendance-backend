@@ -4,28 +4,61 @@ import { env } from '../config/env';
 const WORK_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 
+/**
+ * The company timezone: the office's Timezone (set by the super admin), loaded at startup and updated when the
+ * settings change. APP_TIMEZONE is only the fallback until the office has been read.
+ */
+let companyTz = env.APP_TIMEZONE;
+const tzListeners = new Set<(tz: string) => void>();
+
+export function companyTimezone(): string {
+  return companyTz;
+}
+
+export function setCompanyTimezone(tz: string): void {
+  if (tz === companyTz) return;
+  companyTz = tz;
+  for (const listener of tzListeners) listener(tz);
+}
+
+/** Calls `listener` whenever the company timezone changes. Returns an unsubscribe function. */
+export function onCompanyTimezoneChange(listener: (tz: string) => void): () => void {
+  tzListeners.add(listener);
+  return () => tzListeners.delete(listener);
+}
+
+/** True for an IANA timezone name the runtime knows, e.g. `Asia/Kolkata`. */
+export function isValidTimeZone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return tz.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Current instant truncated to whole seconds, matching what DATETIME2(0) stores. */
 export function nowUtc(): Date {
   return new Date(Math.floor(Date.now() / 1000) * 1000);
 }
 
 /** The work date (`YYYY-MM-DD`, company timezone) that a UTC instant falls on. */
-export function toWorkDate(utc: Date, tz: string = env.APP_TIMEZONE): string {
+export function toWorkDate(utc: Date, tz: string = companyTimezone()): string {
   return formatInTimeZone(utc, tz, 'yyyy-MM-dd');
 }
 
 /** Today's work date in the company timezone. */
-export function todayWorkDate(tz: string = env.APP_TIMEZONE): string {
+export function todayWorkDate(tz: string = companyTimezone()): string {
   return toWorkDate(new Date(), tz);
 }
 
 /** Local time of day (`HH:mm`, company timezone) of a UTC instant. */
-export function toLocalTime(utc: Date, tz: string = env.APP_TIMEZONE): string {
+export function toLocalTime(utc: Date, tz: string = companyTimezone()): string {
   return formatInTimeZone(utc, tz, 'HH:mm');
 }
 
 /** The UTC instant for a local `YYYY-MM-DD` + `HH:mm` in the company timezone. */
-export function combineWorkDateAndTime(date: string, time: string, tz: string = env.APP_TIMEZONE): Date {
+export function combineWorkDateAndTime(date: string, time: string, tz: string = companyTimezone()): Date {
   if (!WORK_DATE_RE.test(date)) throw new Error(`Invalid work date: ${date}`);
   if (!HHMM_RE.test(time)) throw new Error(`Invalid time: ${time}`);
   return fromZonedTime(`${date}T${time}:00`, tz);
@@ -63,7 +96,7 @@ export function monthRange(month: string): { from: string; to: string } {
 }
 
 /** Current month (`YYYY-MM`) in the company timezone. */
-export function currentMonth(tz: string = env.APP_TIMEZONE): string {
+export function currentMonth(tz: string = companyTimezone()): string {
   return formatInTimeZone(new Date(), tz, 'yyyy-MM');
 }
 
@@ -75,8 +108,8 @@ export function computeIsLate(
   clockInUtc: Date,
   workDate: string,
   shiftStart: string,
-  graceMinutes: number = env.LATE_GRACE_MINUTES,
-  tz: string = env.APP_TIMEZONE,
+  graceMinutes: number,
+  tz: string = companyTimezone(),
 ): boolean {
   const threshold = combineWorkDateAndTime(workDate, shiftStart, tz).getTime() + graceMinutes * 60_000;
   return clockInUtc.getTime() > threshold;

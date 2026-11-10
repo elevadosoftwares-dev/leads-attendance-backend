@@ -1,5 +1,8 @@
 {
   "extends": "./tsconfig.json",
-  "compilerOptions": { "noEmit": false },
-  "include": ["src", "db/seed.ts", "scripts"]
+  "compilerOptions": {
+    "noEmit": false
+  },
+  "include": ["src", "db/seed.ts", "scripts"],
+  "exclude": ["scripts/build-postman.ts"]
 }

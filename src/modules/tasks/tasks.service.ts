@@ -9,7 +9,7 @@ import { AppError } from '../../utils/AppError';
 import type { Paginated } from '../../utils/apiResponse';
 import { logger } from '../../utils/logger';
 import { combineWorkDateAndTime, nowUtc, toLocalTime, todayWorkDate } from '../../utils/time';
-import type { AuthUser } from '../auth/auth.types';
+import { isAdminRole, type AuthUser } from '../auth/auth.types';
 import { findUserById } from '../users/users.repository';
 import { toAttachmentDto, toTaskDetail, toTaskSummary, toTaskSummaryWithAssignee } from './tasks.mapper';
 import * as repo from './tasks.repository';
@@ -38,7 +38,7 @@ async function loadTask(taskId: number): Promise<repo.TaskRow> {
 
 /** Admins can see any task; employees only their own. */
 function assertCanView(user: AuthUser, task: repo.TaskRow): void {
-  if (user.role !== 'ADMIN' && task.AssigneeId !== user.id) {
+  if (!isAdminRole(user.role) && task.AssigneeId !== user.id) {
     throw AppError.forbidden('You can only access your own tasks');
   }
 }
@@ -136,7 +136,7 @@ export async function openAttachment(user: AuthUser, attachmentId: number) {
   const attachment = await repo.findAttachmentWithOwner(attachmentId);
   if (!attachment) throw AppError.notFound('File not found');
   const allowed =
-    user.role === 'ADMIN' || attachment.AssigneeId === user.id || attachment.UploadedBy === user.id;
+    isAdminRole(user.role) || attachment.AssigneeId === user.id || attachment.UploadedBy === user.id;
   if (!allowed) throw AppError.forbidden('You do not have access to this file');
   try {
     const { stream, size } = await storage.open(attachment.StoredPath);
@@ -177,7 +177,8 @@ export async function createTask(adminId: number, input: CreateTaskInput): Promi
     dueUtc: combineWorkDateAndTime(input.dueDate, input.dueTime),
     dueWorkDate: input.dueDate,
   });
-  if (input.notify) notifyAssignee(input.assigneeId, taskId, input.title, 'New task assigned');
+  // The assignee always hears about a new task; `notify` is accepted for older clients but ignored.
+  notifyAssignee(input.assigneeId, taskId, input.title, 'New task assigned');
   emitTaskChanged(await repo.findTaskById(taskId));
   return detail(taskId);
 }
@@ -215,8 +216,9 @@ export async function updateTask(taskId: number, input: UpdateTaskInput): Promis
   await repo.updateTask(taskId, changes);
 
   const updated = await detail(taskId);
-  if (input.notify) {
-    const reassigned = input.assigneeId !== undefined && input.assigneeId !== task.AssigneeId;
+  // A new assignee is always told; other edits push only with `notify: true`.
+  const reassigned = input.assigneeId !== undefined && input.assigneeId !== task.AssigneeId;
+  if (reassigned || input.notify) {
     notifyAssignee(
       updated.assignee.id,
       taskId,

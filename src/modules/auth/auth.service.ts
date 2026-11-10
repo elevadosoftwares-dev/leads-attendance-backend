@@ -3,10 +3,16 @@ import { env } from '../../config/env';
 import { withTransaction } from '../../db/pool';
 import { mailService } from '../../services/mail.service';
 import { AppError } from '../../utils/AppError';
+import { accountRemoved } from '../../middleware/auth';
 import { logger } from '../../utils/logger';
+import { fromTimeColumn, isUniqueViolation } from '../../db/pool';
+import { pushService } from '../../services/push.service';
+import { realtime } from '../../services/realtime.service';
+import * as officesRepo from '../offices/offices.repository';
 import { toUserDto, type UserDto } from '../users/users.mapper';
 import * as usersRepo from '../users/users.repository';
 import * as authRepo from './auth.repository';
+import { ADMIN_ROLES } from './auth.types';
 import { generateOpaqueToken, hashToken, refreshTokenExpiry, signAccessToken } from './token.service';
 
 export const BCRYPT_COST = 12;
@@ -32,7 +38,12 @@ async function issueTokens(user: { UserId: number; Role: usersRepo.UserRow['Role
 export async function login(email: string, password: string): Promise<TokenPair & { user: UserDto }> {
   const user = await usersRepo.findUserByEmail(email);
   const passwordOk = await bcrypt.compare(password, user?.PasswordHash ?? (await getDummyHash()));
-  if (!user || !passwordOk || !user.IsActive) throw invalidCredentials();
+  if (!user || !passwordOk) throw invalidCredentials();
+  // Only reveal the account state to someone who knows the password.
+  if (user.Status === 'PENDING') {
+    throw new AppError(403, 'ACCOUNT_PENDING', 'Your account is waiting for admin approval');
+  }
+  if (!user.IsActive) throw new AppError(403, 'ACCOUNT_INACTIVE', 'Your account has been deactivated');
 
   const tokens = await issueTokens(user);
   return { ...tokens, user: toUserDto(user) };
@@ -52,12 +63,18 @@ export async function refresh(refreshToken: string): Promise<TokenPair> {
     return AppError.unauthorized('Refresh token has been revoked');
   };
 
+  // Removing a user revokes their refresh tokens; report that rather than token reuse.
+  const user = await usersRepo.findUserById(row.UserId);
+  if (user && !user.IsActive && user.Status === 'INACTIVE') {
+    await authRepo.revokeAllRefreshTokens(row.UserId);
+    throw accountRemoved();
+  }
+
   if (row.RevokedUtc) throw await reuseDetected();
   if (row.ExpiresUtc.getTime() <= Date.now()) {
     throw new AppError(401, 'TOKEN_EXPIRED', 'Refresh token has expired');
   }
 
-  const user = await usersRepo.findUserById(row.UserId);
   if (!user || !user.IsActive) {
     await authRepo.revokeAllRefreshTokens(row.UserId);
     throw AppError.unauthorized('Account is not active');
@@ -118,4 +135,81 @@ export async function resetPassword(token: string, newPassword: string): Promise
       fields: [{ field: 'token', message: 'invalid or expired' }],
     });
   }
+}
+
+/** The office new users join; until the super admin's seed has run there is none. */
+export async function requireDefaultOffice(): Promise<officesRepo.OfficeRow> {
+  const office = await officesRepo.findDefaultOffice();
+  if (!office) throw new AppError(503, 'SERVICE_UNAVAILABLE', 'No office is configured yet');
+  return office;
+}
+
+export const emailTaken = () =>
+  new AppError(409, 'EMAIL_TAKEN', 'An account with this email already exists', {
+    fields: [{ field: 'email', message: 'is already registered' }],
+  });
+
+export interface PendingUserDto {
+  id: number;
+  name: string;
+  email: string;
+  status: 'PENDING';
+}
+
+/**
+ * Self sign-up. The account is created as a PENDING employee and cannot log in until an admin approves it;
+ * admins are only ever created by the super admin. The shift start and end are the office defaults.
+ */
+export async function signup(name: string, email: string, password: string): Promise<PendingUserDto> {
+  const office = await requireDefaultOffice();
+
+  const passwordHash = await bcrypt.hash(password, BCRYPT_COST);
+  let id: number;
+  try {
+    id = await usersRepo.insertUser({
+      name,
+      email,
+      passwordHash,
+      role: 'EMPLOYEE',
+      officeId: office.OfficeId,
+      shiftStart: fromTimeColumn(office.DefaultShiftStart),
+      shiftEnd: fromTimeColumn(office.DefaultShiftEnd),
+      status: 'PENDING',
+    });
+  } catch (err) {
+    if (isUniqueViolation(err)) throw emailTaken();
+    throw err;
+  }
+
+  const dto: PendingUserDto = { id, name, email, status: 'PENDING' };
+  realtime.userPending(dto);
+  void pushService.notifyAllActive(
+    {
+      title: 'New sign-up awaiting approval',
+      body: `${name} (${email})`,
+      data: { type: 'USER_PENDING', userId: String(id) },
+    },
+    ADMIN_ROLES,
+  );
+  return dto;
+}
+
+/** Changes the signed-in user's password and signs out every other device. */
+export async function changePassword(
+  userId: number,
+  currentPassword: string,
+  newPassword: string,
+): Promise<void> {
+  const user = await usersRepo.findUserById(userId);
+  if (!user || !user.IsActive) throw AppError.unauthorized('Account is not active');
+  if (!(await bcrypt.compare(currentPassword, user.PasswordHash))) {
+    throw AppError.validation('Current password is incorrect', {
+      fields: [{ field: 'currentPassword', message: 'is incorrect' }],
+    });
+  }
+  const passwordHash = await bcrypt.hash(newPassword, BCRYPT_COST);
+  await withTransaction(async (tx) => {
+    await usersRepo.updatePasswordHash(userId, passwordHash, tx);
+    await authRepo.revokeAllRefreshTokens(userId, tx);
+  });
 }

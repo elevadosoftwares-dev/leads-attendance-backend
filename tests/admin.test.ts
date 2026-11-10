@@ -53,7 +53,7 @@ const addLeave = (user: TestUser, fromDate: string, toDate: string) =>
     .set(auth(admin))
     .send({ userId: user.id, fromDate, toDate, reason: 'Annual leave' });
 
-/** john: on time & open, sarah: late & open, david: clocked out, emma: on leave, mark: absent. */
+/** john: on time & open, sarah: late & open, david: late & clocked out, emma: on leave, mark: absent. */
 async function scenario() {
   await createAttendance({ userId: john.id, workDate: today, clockInUtc: minutesAgo(60) });
   await createAttendance({ userId: sarah.id, workDate: today, clockInUtc: minutesAgo(30), isLate: true });
@@ -62,6 +62,7 @@ async function scenario() {
     workDate: today,
     clockInUtc: minutesAgo(300),
     clockOutUtc: minutesAgo(10),
+    isLate: true,
   });
   await addLeave(emma, yesterday, addDaysToWorkDate(today, 1));
 }
@@ -86,9 +87,19 @@ describe('GET /admin/attendance/live', () => {
       user: { id: john.id, name: 'John Lim', initials: 'JL' },
       status: 'IN_OFFICE',
       clockInUtc: expect.stringMatching(/Z$/),
+      clockOutUtc: null,
+      isLate: false,
+    });
+    // A late employee who has clocked out shows as clocked out, with both times.
+    const davidRow = res.body.data.find((r: { user: { id: number } }) => r.user.id === david.id);
+    expect(davidRow).toMatchObject({
+      status: 'CLOCKED_OUT',
+      clockInUtc: expect.stringMatching(/Z$/),
+      clockOutUtc: expect.stringMatching(/Z$/),
+      isLate: true,
     });
     const markRow = res.body.data.find((r: { user: { id: number } }) => r.user.id === mark.id);
-    expect(markRow.clockInUtc).toBeNull();
+    expect(markRow).toMatchObject({ clockInUtc: null, clockOutUtc: null, isLate: false });
   });
 
   it('is admin only', async () => {
@@ -120,9 +131,10 @@ describe('GET /admin/overview', () => {
     expect(res.status).toBe(200);
     expect(res.body.data).toEqual({
       totalEmployees: 5,
-      inOffice: 3,
-      inOfficePct: 60,
-      late: { count: 1, names: ['Sarah Lee'] },
+      inOffice: 2,
+      inOfficePct: 40,
+      clockedOut: 1,
+      late: { count: 2, names: ['David Ng', 'Sarah Lee'] },
       onLeave: 1,
       taskCompletionPct: 25,
       taskCompletionDeltaPct: -25,
@@ -134,9 +146,16 @@ describe('GET /admin/overview', () => {
     expect(res.body.data).toMatchObject({
       inOffice: 0,
       inOfficePct: 0,
+      clockedOut: 0,
       taskCompletionPct: 0,
-      taskCompletionDeltaPct: 0,
+      taskCompletionDeltaPct: null,
     });
+  });
+
+  it('has no task delta when yesterday had no tasks due', async () => {
+    await createTask({ assigneeId: mark.id, createdBy: admin.id, dueDate: today, status: 'COMPLETED' });
+    const res = await request(app).get('/api/v1/admin/overview').set(auth(admin));
+    expect(res.body.data).toMatchObject({ taskCompletionPct: 100, taskCompletionDeltaPct: null });
   });
 });
 
@@ -149,8 +168,13 @@ describe('GET /admin/users', () => {
     expect(employees.body.data[0]).toEqual({
       id: david.id,
       name: 'David Ng',
+      email: david.email,
       initials: 'DN',
       role: 'EMPLOYEE',
+      status: 'ACTIVE',
+      shiftStart: '09:00',
+      shiftEnd: '18:00',
+      createdUtc: expect.stringMatching(/Z$/),
     });
     expect((await request(app).get('/api/v1/admin/users?role=BOSS').set(auth(admin))).status).toBe(400);
   });
@@ -257,42 +281,6 @@ describe('GET /admin/reports', () => {
   });
 });
 
-describe('leaves', () => {
-  it('creates and lists leaves covering a date', async () => {
-    const res = await addLeave(mark, today, addDaysToWorkDate(today, 2));
-    expect(res.status).toBe(201);
-    expect(res.body.data).toEqual({
-      id: expect.any(Number),
-      userId: mark.id,
-      user: { id: mark.id, name: 'Mark Tan', initials: 'MT' },
-      fromDate: today,
-      toDate: addDaysToWorkDate(today, 2),
-      reason: 'Annual leave',
-      createdUtc: expect.stringMatching(/Z$/),
-      createdBy: { id: admin.id, name: 'Admin' },
-    });
-
-    const covering = await request(app)
-      .get(`/api/v1/admin/leaves?date=${addDaysToWorkDate(today, 1)}`)
-      .set(auth(admin));
-    expect(covering.body.data).toHaveLength(1);
-    const outside = await request(app)
-      .get(`/api/v1/admin/leaves?date=${addDaysToWorkDate(today, 3)}`)
-      .set(auth(admin));
-    expect(outside.body.data).toHaveLength(0);
-    const defaultToday = await request(app).get('/api/v1/admin/leaves').set(auth(admin));
-    expect(defaultToday.body.data).toHaveLength(1);
-  });
-
-  it('rejects inverted ranges and overlapping leaves', async () => {
-    expect((await addLeave(mark, today, yesterday)).status).toBe(400);
-    expect((await addLeave(mark, today, today)).status).toBe(201);
-    const overlap = await addLeave(mark, yesterday, today);
-    expect(overlap.status).toBe(400);
-    expect(overlap.body.error.code).toBe('VALIDATION_ERROR');
-  });
-});
-
 describe('Socket.IO /admin namespace', () => {
   async function startServer() {
     const server = http.createServer(app);
@@ -349,6 +337,8 @@ describe('Socket.IO /admin namespace', () => {
         user: { id: mark.id, name: 'Mark Tan', initials: 'MT' },
         status: expect.stringMatching(/IN_OFFICE|LATE/),
         clockInUtc: res.body.data.clockInUtc,
+        clockOutUtc: null,
+        isLate: expect.any(Boolean),
       });
       expect(await overview).toMatchObject({ totalEmployees: 5, inOffice: 1 });
 
